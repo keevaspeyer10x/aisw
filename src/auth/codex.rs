@@ -1,6 +1,6 @@
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
 use anyhow::{bail, Context, Result};
@@ -23,7 +23,7 @@ const IMPORTED_BOOTSTRAP_MARKER_FILE: &str = ".aisw-chatgpt-bootstrap-from-live"
 // hash of the canonical CODEX_HOME path, which aisw cannot reconstruct portably.
 const CONFIG_TOML_CONTENTS: &str = "cli_auth_credentials_store = \"file\"\n";
 
-const OAUTH_TIMEOUT: Duration = Duration::from_secs(120);
+const OAUTH_TIMEOUT: Duration = Duration::from_secs(15 * 60);
 const POLL_INTERVAL: Duration = Duration::from_millis(500);
 const OAUTH_CAPTURE_DIR: &str = ".oauth-capture";
 
@@ -549,11 +549,27 @@ fn run_oauth_flow(
     timeout: Duration,
     poll_interval: Duration,
 ) -> Result<PathBuf> {
-    let _spinner = crate::output::start_spinner("Waiting for Codex login to complete...");
+    // Headless hosts (VPS/CI) have no local browser. Codex's durable ChatGPT path is
+    // device-code auth: print a URL + one-time code, complete on any other device.
+    // Do not start a stdout spinner — it races with Codex's device-code output.
+    if !crate::runtime::is_quiet() && !crate::runtime::is_machine_mode() {
+        eprintln!(
+            "Starting Codex device-auth login (browserless).\n             Open the URL Codex prints, enter the one-time code, then aisw will finish automatically.\n             Codes typically expire in ~15 minutes."
+        );
+    }
 
     let mut child = Command::new(codex_bin)
         .arg("login")
+        .arg("--device-auth")
+        // Inherit so the operator can read the device URL/code. Ambient API/PAT
+        // keys must not force a metered login that clobbers ChatGPT subscription auth.
+        .stdin(Stdio::inherit())
+        .stdout(Stdio::inherit())
+        .stderr(Stdio::inherit())
         .env("CODEX_HOME", capture_dir)
+        .env_remove("OPENAI_API_KEY")
+        .env_remove("CODEX_API_KEY")
+        .env_remove("CODEX_ACCESS_TOKEN")
         .spawn()
         .with_context(|| format!("could not spawn {}", codex_bin.display()))?;
 
@@ -579,6 +595,7 @@ fn run_oauth_flow(
             bail!(
                 "{} before aisw could capture credentials.\n  \
                  Codex login completed without writing auth.json into CODEX_HOME.\n  \
+                 On headless hosts, aisw runs `codex login --device-auth`; complete the printed URL/code.\n  \
                  If your Codex build stores auth somewhere else, use an API key instead.",
                 exit_note
             );
@@ -588,7 +605,8 @@ fn run_oauth_flow(
             let _ = child.kill();
             let _ = child.wait();
             bail!(
-                "Codex login timed out after {}s. \
+                "Codex device-auth login timed out after {}s.\n  \
+                 Complete the URL/code Codex printed (codes last ~15 minutes).\n  \
                  If auth.json was not written, verify that config.toml has \
                  cli_auth_credentials_store = \"file\" (not \"keyring\").",
                 timeout.as_secs()
@@ -1364,7 +1382,7 @@ mod tests {
 
     #[test]
     #[cfg(unix)]
-    fn oauth_uses_standard_login_command() {
+    fn oauth_uses_device_auth_login_command() {
         let _g = crate::SPAWN_LOCK.lock().unwrap_or_else(|p| p.into_inner());
         use std::fs;
         use std::os::unix::fs::PermissionsExt;
@@ -1398,7 +1416,7 @@ mod tests {
         .unwrap();
 
         let sentinel = ps.profile_dir(Tool::Codex, "main").join("login_args");
-        assert_eq!(fs::read_to_string(&sentinel).unwrap(), "login ");
+        assert_eq!(fs::read_to_string(&sentinel).unwrap(), "login --device-auth");
     }
 
     #[test]

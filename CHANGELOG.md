@@ -1,5 +1,14 @@
 # Changelog
 
+## Unreleased
+
+### Fixed
+
+- Codex OAuth enrollment now runs `codex login --device-auth` (browserless device-code flow) instead of plain `codex login`, so headless hosts such as a VPS can enroll ChatGPT-managed profiles without a local browser.
+- Extended the Codex OAuth wait window to 15 minutes to match device-code expiry, and stopped the stdout spinner so the one-time code remains readable.
+- Stripped ambient `OPENAI_API_KEY` / `CODEX_API_KEY` / `CODEX_ACCESS_TOKEN` from the Codex login child so metered API-key login cannot replace ChatGPT subscription auth during enrollment.
+
+
 ## 0.3.6 - 2026-06-11
 
 ### Fixed

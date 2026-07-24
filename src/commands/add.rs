@@ -177,7 +177,7 @@ pub(crate) fn run_in(args: AddArgs, home: &Path, tool_path: OsString) -> Result<
             progress.info("starting_upstream_auth", "Starting upstream OAuth flow")?;
             progress.waiting_for_user(
                 "waiting_for_user",
-                "Complete login in the browser or terminal",
+                "Complete login (Codex: device-auth URL + one-time code on any device)",
                 true,
             )?;
         }
