@@ -24,7 +24,15 @@ const KEY_VAR: &str = "GEMINI_API_KEY";
 // profile dir. On switch, copy back to $HOME/.gemini/ (see apply_token_cache).
 const GEMINI_CACHE_DIR: &str = ".gemini";
 const OAUTH_TIMEOUT: Duration = Duration::from_secs(120);
-const OAUTH_PRIMARY_FILES: &[&str] = &["oauth_creds.json"];
+/// Filenames that, on their own, constitute Gemini OAuth credential material.
+///
+/// Gemini CLI has shipped more than one name for this. Older builds wrote
+/// `oauth_creds.json`; current builds observed on Linux write
+/// `gemini-credentials.json`. Both are accepted, because recognising only the
+/// historical name is not a cosmetic miss — see `apply_token_cache`, where a
+/// profile holding no recognised credential file causes the live `~/.gemini`
+/// credential to be DELETED.
+const OAUTH_PRIMARY_FILES: &[&str] = &["oauth_creds.json", "gemini-credentials.json"];
 const POST_AUTH_EXIT_GRACE: Duration = Duration::from_secs(2);
 
 pub fn live_dir(user_home: &Path) -> PathBuf {
@@ -644,6 +652,37 @@ pub fn apply_token_cache(
         .with_context(|| format!("could not create {}", gemini_dir.display()))?;
 
     let profile_dir = profile_store.profile_dir(Tool::Gemini, name);
+
+    // Never trade a working live credential for nothing.
+    //
+    // This function deletes every live file the profile does not also contain
+    // (see the sweep below). That is correct when the profile actually holds a
+    // credential — it is how switching accounts replaces one identity with
+    // another. It is catastrophic when the profile holds none: the live
+    // credential is deleted and nothing replaces it, leaving the user logged
+    // out with no recoverable copy, because the pre-switch backup captures the
+    // empty profile rather than the credential being overwritten.
+    //
+    // A profile can legitimately end up empty: `copy_live_oauth_files_into_profile`
+    // is gated on `has_oauth_credentials`, so if Gemini CLI renames its
+    // credential file, import silently copies zero files (`Ok(0)`) and the
+    // profile is created hollow. The next `aisw use gemini <that-profile>` then
+    // deletes the live credential. Observed on Linux 2026-07: profile contained
+    // only GEMINI.md and installation_id, while `~/.gemini` held a valid
+    // `gemini-credentials.json`.
+    //
+    // Recognising the new filename (OAUTH_PRIMARY_FILES) fixes today's instance;
+    // this guard fixes the class, and will hold the next time the filename moves.
+    if !has_oauth_credentials(&profile_dir)? && has_oauth_credentials(gemini_dir)? {
+        bail!(
+            "refusing to switch: profile '{name}' contains no Gemini OAuth credential, \
+             but live {} does. Applying it would delete the live credential and replace \
+             it with nothing. Re-import the profile (`aisw add gemini {name}`) or pick a \
+             profile that holds a credential.",
+            gemini_dir.display()
+        );
+    }
+
     let mut expected_files = std::collections::BTreeSet::new();
     let mut changes = Vec::new();
     for file in files::list_regular_files_recursive(&profile_dir)? {
@@ -940,6 +979,130 @@ mod tests {
 
     fn stores(dir: &std::path::Path) -> (ProfileStore, ConfigStore) {
         (ProfileStore::new(dir), ConfigStore::new(dir))
+    }
+
+    /// Regression: an empty profile must never be applied over a live credential.
+    ///
+    /// `apply_token_cache` deletes every live file the profile does not contain.
+    /// With a hollow profile that deletes the user's Gemini login and replaces it
+    /// with nothing, and the pre-switch backup captures the hollow profile rather
+    /// than the credential being destroyed — so it is unrecoverable.
+    ///
+    /// A profile becomes hollow silently: import is gated on `has_oauth_credentials`,
+    /// so a Gemini CLI credential-filename change makes `copy_live_oauth_files_into_profile`
+    /// copy zero files and report success.
+    #[test]
+    fn apply_token_cache_refuses_a_profile_with_no_credential_over_a_live_one() {
+        let dir = tempdir().unwrap();
+        let (profiles, _) = stores(dir.path());
+
+        // Hollow profile: real files, but no credential among them — exactly the
+        // shape observed on Linux 2026-07.
+        let profile_dir = profiles.profile_dir(Tool::Gemini, "hollow");
+        std::fs::create_dir_all(&profile_dir).unwrap();
+        std::fs::write(profile_dir.join("GEMINI.md"), b"# notes").unwrap();
+        std::fs::write(profile_dir.join("installation_id"), b"abc123").unwrap();
+
+        let live = dir.path().join("live-gemini");
+        std::fs::create_dir_all(&live).unwrap();
+        let cred = live.join("gemini-credentials.json");
+        std::fs::write(&cred, br#"{"access_token":"live-and-working"}"#).unwrap();
+        std::fs::write(live.join("settings.json"), b"{}").unwrap();
+
+        let err = apply_token_cache(&profiles, "hollow", &live).unwrap_err();
+
+        assert!(
+            err.to_string().contains("refusing to switch"),
+            "expected a refusal, got: {err}"
+        );
+        assert!(
+            cred.exists(),
+            "the live credential must survive a refused switch"
+        );
+        assert_eq!(
+            std::fs::read(&cred).unwrap(),
+            br#"{"access_token":"live-and-working"}"#.to_vec(),
+            "the live credential must be untouched, not merely present"
+        );
+        assert!(
+            live.join("settings.json").exists(),
+            "unrelated live state must survive too"
+        );
+    }
+
+    /// The guard must not block legitimate account switching.
+    #[test]
+    fn apply_token_cache_still_switches_when_the_profile_holds_a_credential() {
+        let dir = tempdir().unwrap();
+        let (profiles, _) = stores(dir.path());
+
+        let profile_dir = profiles.profile_dir(Tool::Gemini, "other-account");
+        std::fs::create_dir_all(&profile_dir).unwrap();
+        std::fs::write(
+            profile_dir.join("gemini-credentials.json"),
+            br#"{"access_token":"the-other-account"}"#,
+        )
+        .unwrap();
+
+        let live = dir.path().join("live-gemini");
+        std::fs::create_dir_all(&live).unwrap();
+        std::fs::write(
+            live.join("gemini-credentials.json"),
+            br#"{"access_token":"the-first-account"}"#,
+        )
+        .unwrap();
+
+        apply_token_cache(&profiles, "other-account", &live).unwrap();
+
+        assert_eq!(
+            std::fs::read(live.join("gemini-credentials.json")).unwrap(),
+            br#"{"access_token":"the-other-account"}"#.to_vec(),
+            "a profile holding a credential must still replace the live one"
+        );
+    }
+
+    /// Applying a hollow profile when there is nothing live to lose is allowed —
+    /// the guard protects a credential, it does not forbid an empty state.
+    #[test]
+    fn apply_token_cache_allows_a_hollow_profile_when_live_has_no_credential() {
+        let dir = tempdir().unwrap();
+        let (profiles, _) = stores(dir.path());
+
+        let profile_dir = profiles.profile_dir(Tool::Gemini, "hollow");
+        std::fs::create_dir_all(&profile_dir).unwrap();
+        std::fs::write(profile_dir.join("GEMINI.md"), b"# notes").unwrap();
+
+        let live = dir.path().join("live-gemini");
+        std::fs::create_dir_all(&live).unwrap();
+        std::fs::write(live.join("settings.json"), b"{}").unwrap();
+
+        assert!(apply_token_cache(&profiles, "hollow", &live).is_ok());
+    }
+
+    /// Both historical and current Gemini credential filenames must count.
+    /// Recognising only `oauth_creds.json` is what let a hollow profile form.
+    #[test]
+    fn both_known_credential_filenames_are_recognised() {
+        for name in ["oauth_creds.json", "gemini-credentials.json"] {
+            let dir = tempdir().unwrap();
+            let cache = dir.path().join(".gemini");
+            std::fs::create_dir_all(&cache).unwrap();
+            std::fs::write(cache.join(name), b"{}").unwrap();
+            assert!(
+                has_oauth_credentials(&cache).unwrap(),
+                "{name} must be recognised as credential material"
+            );
+        }
+    }
+
+    #[test]
+    fn unrelated_files_are_not_mistaken_for_credentials() {
+        let dir = tempdir().unwrap();
+        let cache = dir.path().join(".gemini");
+        std::fs::create_dir_all(&cache).unwrap();
+        std::fs::write(cache.join("settings.json"), b"{}").unwrap();
+        std::fs::write(cache.join("GEMINI.md"), b"# notes").unwrap();
+        assert!(!has_oauth_credentials(&cache).unwrap());
     }
 
     #[test]
