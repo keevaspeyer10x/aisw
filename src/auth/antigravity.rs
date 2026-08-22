@@ -1,4 +1,5 @@
 use std::collections::BTreeMap;
+use std::fmt;
 use std::fs;
 use std::io::Read;
 use std::path::{Path, PathBuf};
@@ -21,6 +22,18 @@ const SECRET_FILE: &str = "keyring-secret.json";
 const AUTH_SOURCE_FILE: &str = "auth-source.json";
 pub(crate) const HEADLESS_TOKEN_FILE: &str = "antigravity-oauth-token";
 pub(crate) const STORED_HEADLESS_TOKEN_FILE: &str = "app/antigravity-oauth-token";
+
+#[derive(Debug)]
+struct InvalidLiveHeadlessToken(String);
+
+impl fmt::Display for InvalidLiveHeadlessToken {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for InvalidLiveHeadlessToken {}
+
 const APP_PREFIX: &str = "app";
 const SHARED_PREFIX: &str = "shared";
 const OAUTH_TIMEOUT: Duration = Duration::from_secs(180);
@@ -222,46 +235,67 @@ fn read_validated_live_headless_token(user_home: &Path) -> Result<Option<Vec<u8>
         }
     };
     if initial_metadata.file_type().is_symlink() || !initial_metadata.file_type().is_file() {
-        bail!(
+        return Err(InvalidLiveHeadlessToken(format!(
             "refusing Antigravity headless token that is not a regular file: {}",
             path.display()
-        );
+        ))
+        .into());
     }
 
-    let mut file = fs::OpenOptions::new()
+    let mut file = match fs::OpenOptions::new()
         .read(true)
         .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
         .open(&path)
-        .with_context(|| format!("could not securely open {}", path.display()))?;
+    {
+        Ok(file) => file,
+        Err(error) if error.raw_os_error() == Some(libc::ELOOP) => {
+            return Err(InvalidLiveHeadlessToken(format!(
+                "refusing symlinked Antigravity headless token: {}",
+                path.display()
+            ))
+            .into());
+        }
+        Err(error) => {
+            return Err(error)
+                .with_context(|| format!("could not securely open {}", path.display()));
+        }
+    };
     let metadata = file
         .metadata()
         .with_context(|| format!("could not inspect opened token {}", path.display()))?;
     if !metadata.file_type().is_file() {
-        bail!(
+        return Err(InvalidLiveHeadlessToken(format!(
             "refusing Antigravity headless token that is not a regular file: {}",
             path.display()
-        );
+        ))
+        .into());
     }
     let mode = metadata.permissions().mode() & 0o777;
     if mode != 0o600 {
-        bail!(
+        return Err(InvalidLiveHeadlessToken(format!(
             "permissions on {} are too broad (got {:04o}, expected 0600)",
             path.display(),
             mode
-        );
+        ))
+        .into());
     }
     if metadata.uid() != unsafe { libc::geteuid() } {
-        bail!(
+        return Err(InvalidLiveHeadlessToken(format!(
             "refusing Antigravity headless token not owned by the current user: {}",
             path.display()
-        );
+        ))
+        .into());
     }
 
     let mut token = Vec::new();
     file.read_to_end(&mut token)
         .with_context(|| format!("could not read opened token {}", path.display()))?;
     if token.is_empty() {
-        bail!("Antigravity headless token is empty: {}", path.display());
+        return Err(InvalidLiveHeadlessToken(format!(
+            "Antigravity headless token is empty: {}",
+            path.display()
+        ))
+        .into());
     }
     Ok(Some(token))
 }
@@ -737,8 +771,13 @@ pub fn sync_profile_from_live_if_same_identity(
     backend: CredentialBackend,
     user_home: &Path,
 ) -> Result<bool> {
-    let Some(snapshot) = live_credentials_snapshot_for_import(user_home)? else {
-        return Ok(false);
+    let snapshot = match live_credentials_snapshot_for_import(user_home) {
+        Ok(Some(snapshot)) => snapshot,
+        Ok(None) => return Ok(false),
+        Err(error) if error.downcast_ref::<InvalidLiveHeadlessToken>().is_some() => {
+            return Ok(false);
+        }
+        Err(error) => return Err(error),
     };
     let profile_source = read_profile_credential_source(profile_store, profile_name)?;
     if snapshot.credential_source != profile_source {
@@ -1491,6 +1530,13 @@ mod tests {
             !live_state_matches(&profile_store, "work", CredentialBackend::File, &user_home,)
                 .unwrap()
         );
+        assert!(!sync_profile_from_live_if_same_identity(
+            &profile_store,
+            "work",
+            CredentialBackend::File,
+            &user_home,
+        )
+        .unwrap());
     }
 
     #[cfg(target_os = "linux")]
