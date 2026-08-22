@@ -85,6 +85,35 @@ fn write_antigravity_live_state(
     std::fs::write(secret_path, secret).unwrap();
 }
 
+#[cfg(target_os = "linux")]
+fn write_antigravity_headless_live_state(env: &TestEnv, secret: &str, theme: &str) {
+    use std::os::unix::fs::PermissionsExt;
+
+    let app_dir = env.fake_home.join(".gemini").join("antigravity-cli");
+    let shared_dir = env.fake_home.join(".gemini").join("config");
+    std::fs::create_dir_all(&app_dir).unwrap();
+    std::fs::create_dir_all(&shared_dir).unwrap();
+    std::fs::write(
+        app_dir.join("settings.json"),
+        format!(r#"{{"theme":"{theme}"}}"#),
+    )
+    .unwrap();
+    let token_path = app_dir.join("antigravity-oauth-token");
+    std::fs::write(&token_path, secret).unwrap();
+    std::fs::set_permissions(&token_path, std::fs::Permissions::from_mode(0o600)).unwrap();
+}
+
+#[cfg(target_os = "linux")]
+fn add_antigravity_headless_profile(env: &TestEnv, name: &str, secret: &str, theme: &str) {
+    env.add_fake_tool("agy", "agy 1.1.18");
+    write_antigravity_headless_live_state(env, secret, theme);
+    env.cmd()
+        .env("AISW_KEYRING_TEST_UNAVAILABLE", "1")
+        .args(["add", "antigravity", name, "--from-live"])
+        .assert()
+        .success();
+}
+
 fn add_antigravity_profile_from_live(
     env: &TestEnv,
     name: &str,
@@ -1077,6 +1106,80 @@ fn use_antigravity_restores_live_keyring_and_config_roots() {
     let config: serde_json::Value =
         serde_json::from_str(&env.read_home_file("config.json")).unwrap();
     assert_eq!(config["active"]["antigravity"], "work");
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn use_antigravity_headless_profile_switches_native_file_without_keyring_write() {
+    let env = TestEnv::new();
+    add_antigravity_headless_profile(&env, "work", ANTIGRAVITY_SECRET_WORK, "terminal");
+    write_antigravity_headless_live_state(&env, ANTIGRAVITY_SECRET_PERSONAL, "light");
+
+    env.cmd()
+        .env("AISW_KEYRING_TEST_UNAVAILABLE", "1")
+        .args(["use", "antigravity", "work"])
+        .assert()
+        .success()
+        .stdout(contains("OAuth shared live headless file"));
+
+    assert_eq!(
+        std::fs::read_to_string(
+            env.fake_home
+                .join(".gemini")
+                .join("antigravity-cli")
+                .join("antigravity-oauth-token")
+        )
+        .unwrap(),
+        ANTIGRAVITY_SECRET_WORK
+    );
+    assert!(!antigravity_live_keyring_secret_path(&env).exists());
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn use_antigravity_headless_profile_refuses_when_keyring_becomes_accessible() {
+    let env = TestEnv::new();
+    add_antigravity_headless_profile(&env, "work", ANTIGRAVITY_SECRET_WORK, "terminal");
+
+    env.cmd()
+        .args(["use", "antigravity", "work"])
+        .assert()
+        .failure()
+        .stderr(contains(
+            "refusing to apply an Antigravity headless-file profile while the OS keyring is accessible",
+        ));
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn use_antigravity_keyring_profile_fails_before_live_file_mutation_when_keyring_is_unavailable() {
+    let env = TestEnv::new();
+    add_antigravity_profile_from_live(
+        &env,
+        "work",
+        ANTIGRAVITY_SECRET_WORK,
+        "terminal",
+        "plan",
+        "repo",
+    );
+    write_antigravity_live_state(&env, ANTIGRAVITY_SECRET_PERSONAL, "light", "chat", "other");
+    let settings_path = env
+        .fake_home
+        .join(".gemini")
+        .join("antigravity-cli")
+        .join("settings.json");
+    let before = std::fs::read(&settings_path).unwrap();
+
+    env.cmd()
+        .env("AISW_KEYRING_TEST_UNAVAILABLE", "1")
+        .args(["use", "antigravity", "work"])
+        .assert()
+        .failure()
+        .stderr(contains(
+            "cannot apply an Antigravity keyring-backed profile while the OS keyring is unavailable",
+        ));
+
+    assert_eq!(std::fs::read(&settings_path).unwrap(), before);
 }
 
 #[test]

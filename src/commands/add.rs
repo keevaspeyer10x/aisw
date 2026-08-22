@@ -132,6 +132,7 @@ pub(crate) fn run_in(args: AddArgs, home: &Path, tool_path: OsString) -> Result<
             Some(env_var),
             AuthMethod::ApiKey,
             None,
+            None,
             progress.as_mut(),
         )?;
         return Ok(());
@@ -301,12 +302,25 @@ pub(crate) fn run_in(args: AddArgs, home: &Path, tool_path: OsString) -> Result<
     }
 
     let user_home = dirs::home_dir();
+    let antigravity_auth_classification = if args.tool == Tool::Antigravity {
+        auth::antigravity::classify_profile(
+            &profile_store,
+            &args.profile_name,
+            auth_method,
+            backend,
+        )
+        .ok()
+        .map(|classification| classification.as_str())
+    } else {
+        None
+    };
     emit_add_result(
         &args,
         backend,
         source,
         auth_method,
         user_home.as_deref(),
+        antigravity_auth_classification,
         progress.as_mut(),
     )?;
 
@@ -627,6 +641,7 @@ fn from_live_claude(args: AddArgs, home: &Path, user_home: &Path) -> Result<()> 
         stored_backend,
         AuthMethod::OAuth,
         Some(user_home),
+        None,
     )
 }
 
@@ -866,7 +881,14 @@ fn from_live_codex(args: AddArgs, home: &Path, user_home: &Path) -> Result<()> {
         return Err(e);
     }
 
-    finalize_from_live(&args, Tool::Codex, backend, auth_method, Some(user_home))
+    finalize_from_live(
+        &args,
+        Tool::Codex,
+        backend,
+        auth_method,
+        Some(user_home),
+        None,
+    )
 }
 
 fn from_live_gemini(args: AddArgs, home: &Path, user_home: &Path) -> Result<()> {
@@ -1065,6 +1087,7 @@ fn from_live_gemini(args: AddArgs, home: &Path, user_home: &Path) -> Result<()> 
         CredentialBackend::File,
         auth_method,
         None,
+        None,
     )
 }
 
@@ -1158,12 +1181,20 @@ fn from_live_antigravity(args: AddArgs, home: &Path, user_home: &Path) -> Result
         return Err(e);
     }
 
+    let antigravity_auth_classification = auth::antigravity::classify_profile(
+        &profile_store,
+        &args.profile_name,
+        AuthMethod::OAuth,
+        backend,
+    )?
+    .as_str();
     finalize_from_live(
         &args,
         Tool::Antigravity,
         backend,
         AuthMethod::OAuth,
         Some(user_home),
+        Some(antigravity_auth_classification),
     )
 }
 
@@ -1173,9 +1204,15 @@ fn finalize_from_live(
     backend: CredentialBackend,
     auth_method: AuthMethod,
     user_home: Option<&Path>,
+    antigravity_auth_classification: Option<&'static str>,
 ) -> Result<()> {
     let codex_auth_classification = codex_add_classification(tool, auth_method, true, user_home);
-    let warnings = add_warnings(tool, auth_method, user_home);
+    let warnings = add_warnings(
+        tool,
+        auth_method,
+        user_home,
+        antigravity_auth_classification,
+    );
     let result = serde_json::json!({
         "tool": tool.binary_name(),
         "profile": args.profile_name,
@@ -1185,7 +1222,7 @@ fn finalize_from_live(
         "source": "from_live",
         "claude_auth_classification": claude_add_classification(tool, auth_method, user_home),
         "codex_auth_classification": codex_auth_classification,
-        "antigravity_auth_classification": antigravity_add_classification(tool, auth_method),
+        "antigravity_auth_classification": antigravity_auth_classification,
         "warnings": warnings,
     });
     if runtime::is_progress_json() {
@@ -1214,7 +1251,7 @@ fn finalize_from_live(
     if let Some(classification) = codex_auth_classification {
         output::print_kv("Codex auth", classification);
     }
-    if let Some(classification) = antigravity_add_classification(tool, auth_method) {
+    if let Some(classification) = antigravity_auth_classification {
         output::print_kv("Antigravity auth", classification);
     }
     output::print_kv("Activation", "active");
@@ -1242,11 +1279,23 @@ fn finalize_from_live(
         }
     }
     if tool == Tool::Antigravity {
-        output::print_effect(
-            "Antigravity restores the shared live OS keyring credential and the documented ~/.gemini config roots when you switch profiles.",
-        );
+        output::print_effect(match antigravity_auth_classification {
+            Some("oauth_shared_live_headless_file") => {
+                "Antigravity restores its native protected headless token file and the documented ~/.gemini config roots when you switch profiles."
+            }
+            _ => {
+                "Antigravity restores the shared live OS keyring credential and the documented ~/.gemini config roots when you switch profiles."
+            }
+        });
     }
-    if let Some(warning) = add_warnings(tool, auth_method, user_home).first() {
+    if let Some(warning) = add_warnings(
+        tool,
+        auth_method,
+        user_home,
+        antigravity_auth_classification,
+    )
+    .first()
+    {
         output::print_effect(warning);
     }
     output::print_blank_line();
@@ -1283,7 +1332,7 @@ fn validate_auth_source_support(args: &AddArgs) -> Result<()> {
     }
     if args.api_key.is_some() || args.api_key_stdin {
         bail!(
-            "Antigravity CLI support in aisw is OAuth-only because upstream documents system-keyring-backed sign-in, not API-key profile auth.\n  \
+            "Antigravity CLI support in aisw is OAuth-only; its live session may be keyring-backed or use the native headless-Linux token file, but it does not expose API-key profile auth.\n  \
              Use 'aisw add antigravity <name>' or 'aisw add antigravity <name> --from-live'."
         );
     }
@@ -1300,6 +1349,7 @@ fn print_add_summary(
     source: Option<&str>,
     auth_method: AuthMethod,
     user_home: Option<&Path>,
+    antigravity_auth_classification: Option<&'static str>,
 ) {
     let codex_auth_classification =
         codex_add_classification(args.tool, auth_method, false, user_home);
@@ -1320,7 +1370,7 @@ fn print_add_summary(
     if let Some(classification) = codex_auth_classification {
         output::print_kv("Codex auth", classification);
     }
-    if let Some(classification) = antigravity_add_classification(args.tool, auth_method) {
+    if let Some(classification) = antigravity_auth_classification {
         output::print_kv("Antigravity auth", classification);
     }
     if let Some(source) = source {
@@ -1343,14 +1393,24 @@ fn print_add_summary(
         output::print_effect("This is the durable ChatGPT-managed Codex path.");
     }
     if args.tool == Tool::Antigravity {
-        output::print_effect(
-            "Antigravity OAuth is restored through the shared live OS keyring entry and the documented ~/.gemini config roots.",
-        );
+        output::print_effect(match antigravity_auth_classification {
+            Some("oauth_shared_live_headless_file") => {
+                "Antigravity OAuth is restored through its native protected headless token file and the documented ~/.gemini config roots."
+            }
+            _ => {
+                "Antigravity OAuth is restored through the shared live OS keyring entry and the documented ~/.gemini config roots."
+            }
+        });
         output::print_effect(
             "Upstream does not currently document an isolated per-profile auth root or profile selector for Antigravity.",
         );
     }
-    for warning in add_warnings(args.tool, auth_method, user_home) {
+    for warning in add_warnings(
+        args.tool,
+        auth_method,
+        user_home,
+        antigravity_auth_classification,
+    ) {
         output::print_effect(warning);
     }
     output::print_blank_line();
@@ -1367,11 +1427,17 @@ fn emit_add_result(
     source: Option<&str>,
     auth_method: AuthMethod,
     user_home: Option<&Path>,
+    antigravity_auth_classification: Option<&'static str>,
     progress: Option<&mut machine::ProgressReporter>,
 ) -> Result<()> {
     let codex_auth_classification =
         codex_add_classification(args.tool, auth_method, args.from_live, user_home);
-    let warnings = add_warnings(args.tool, auth_method, user_home);
+    let warnings = add_warnings(
+        args.tool,
+        auth_method,
+        user_home,
+        antigravity_auth_classification,
+    );
     let result = serde_json::json!({
         "tool": args.tool.binary_name(),
         "profile": args.profile_name,
@@ -1381,7 +1447,7 @@ fn emit_add_result(
         "source": source,
         "claude_auth_classification": claude_add_classification(args.tool, auth_method, user_home),
         "codex_auth_classification": codex_auth_classification,
-        "antigravity_auth_classification": antigravity_add_classification(args.tool, auth_method),
+        "antigravity_auth_classification": antigravity_auth_classification,
         "warnings": warnings,
     });
     if let Some(progress) = progress {
@@ -1392,7 +1458,14 @@ fn emit_add_result(
         return Ok(());
     }
 
-    print_add_summary(args, backend, source, auth_method, user_home);
+    print_add_summary(
+        args,
+        backend,
+        source,
+        auth_method,
+        user_home,
+        antigravity_auth_classification,
+    );
     Ok(())
 }
 
@@ -1437,11 +1510,6 @@ fn codex_add_classification(
     })
 }
 
-fn antigravity_add_classification(tool: Tool, auth_method: AuthMethod) -> Option<&'static str> {
-    (tool == Tool::Antigravity && auth_method == AuthMethod::OAuth)
-        .then_some("oauth_shared_live_keyring")
-}
-
 fn claude_add_classification(
     tool: Tool,
     auth_method: AuthMethod,
@@ -1471,11 +1539,21 @@ fn claude_add_classification(
     })
 }
 
-fn add_warnings(tool: Tool, auth_method: AuthMethod, user_home: Option<&Path>) -> Vec<String> {
+fn add_warnings(
+    tool: Tool,
+    auth_method: AuthMethod,
+    user_home: Option<&Path>,
+    antigravity_auth_classification: Option<&str>,
+) -> Vec<String> {
     if tool == Tool::Antigravity && auth_method == AuthMethod::OAuth {
-        return vec![
-            "Antigravity currently documents shared live OS-keyring auth, not an isolated per-profile auth root. aisw switches the live keyring-backed session and Antigravity config roots transactionally.".to_owned(),
-        ];
+        return vec![match antigravity_auth_classification {
+            Some("oauth_shared_live_headless_file") => {
+                "Antigravity's protected file token is a native headless-Linux fallback, not an isolated per-profile auth root. aisw switches that shared live token and Antigravity config roots transactionally, and refuses this profile if the OS keyring is accessible.".to_owned()
+            }
+            _ => {
+                "Antigravity currently uses shared live OS-keyring auth, not an isolated per-profile auth root. aisw switches the live keyring-backed session and Antigravity config roots transactionally.".to_owned()
+            }
+        }];
     }
     if tool == Tool::Gemini && auth_method == AuthMethod::OAuth {
         return vec![

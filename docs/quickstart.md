@@ -78,7 +78,7 @@ For Codex ChatGPT-managed auth, this interactive path is the durable setup becau
 
 Upstream Gemini CLI docs currently recommend Google-account login for interactive local use. Some account types still require `GOOGLE_CLOUD_PROJECT`, especially Workspace / Code Assist-style setups and certain region-limited cases. For headless or automation use, prefer `GEMINI_API_KEY` or Vertex AI.
 
-For Antigravity, `aisw add antigravity <name>` captures the shared live keyring-backed OAuth session that `agy` creates and stores the documented Antigravity config roots alongside it. Upstream does not currently document an isolated per-profile auth root.
+For Antigravity, `aisw add antigravity <name>` captures the shared live OAuth session that `agy` creates—OS keyring on supported sessions, or its protected native token file on headless Linux—and stores the documented Antigravity config roots alongside it. Upstream does not currently document an isolated per-profile auth root.
 
 If you want machine-readable OAuth progress for a GUI:
 

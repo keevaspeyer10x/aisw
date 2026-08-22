@@ -125,11 +125,11 @@ On Linux, if the Secret Service daemon is not available at runtime (e.g. headles
 
 ### Antigravity CLI
 
-- Live auth: shared OS-native keyring entry documented by upstream behavior
+- Live auth: shared OS-native keyring entry, or Antigravity's native protected file token on headless Linux when the keyring is unavailable
 - Live state: `~/.gemini/antigravity-cli/` and `~/.gemini/config/`
-- `--from-live`: captures the current live keyring-backed session plus both documented config roots.
-- Interactive OAuth: launches `agy`, captures the resulting live keyring/config state, and restores the prior live state unless `--set-active` is requested.
-- `use`: restores the managed keyring secret into Antigravity's live keyring entry, then transactionally syncs the documented config roots.
+- `--from-live`: captures the exact live auth source plus both documented config roots.
+- Interactive OAuth: launches `agy`, captures the resulting live auth/config state, and restores the prior live state unless `--set-active` is requested.
+- `use`: restores either the managed keyring secret or the native headless token file, then transactionally syncs the documented config roots. Headless-file profiles are Linux-only and fail closed if the OS keyring is accessible.
 
 **Important Antigravity limitation:** upstream does not currently document an isolated per-profile auth/data root or profile selector. `aisw` therefore supports Antigravity through shared live switching rather than profile-owned isolated auth. This is a product limitation upstream, not `aisw` corruption.
 

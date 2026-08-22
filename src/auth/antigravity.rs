@@ -17,6 +17,9 @@ use crate::types::Tool;
 
 pub(crate) const KEYRING_METADATA_FILE: &str = "keyring.json";
 const SECRET_FILE: &str = "keyring-secret.json";
+const AUTH_SOURCE_FILE: &str = "auth-source.json";
+pub(crate) const HEADLESS_TOKEN_FILE: &str = "antigravity-oauth-token";
+pub(crate) const STORED_HEADLESS_TOKEN_FILE: &str = "app/antigravity-oauth-token";
 const APP_PREFIX: &str = "app";
 const SHARED_PREFIX: &str = "shared";
 const OAUTH_TIMEOUT: Duration = Duration::from_secs(180);
@@ -26,20 +29,30 @@ const KEYRING_ACCOUNT: &str = "antigravity";
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AntigravityAuthClassification {
     OauthSharedLiveKeyring,
+    OauthSharedLiveHeadlessFile,
 }
 
 impl AntigravityAuthClassification {
     pub fn as_str(self) -> &'static str {
         match self {
             Self::OauthSharedLiveKeyring => "oauth_shared_live_keyring",
+            Self::OauthSharedLiveHeadlessFile => "oauth_shared_live_headless_file",
         }
     }
 
     pub fn human_label(self) -> &'static str {
         match self {
             Self::OauthSharedLiveKeyring => "OAuth shared live keyring",
+            Self::OauthSharedLiveHeadlessFile => "OAuth shared live headless file",
         }
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LiveCredentialSource {
+    Keyring,
+    HeadlessFile,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -50,6 +63,7 @@ pub struct KeyringRef {
 
 #[derive(Debug, Clone)]
 pub struct LiveSnapshot {
+    pub credential_source: LiveCredentialSource,
     pub keyring_ref: KeyringRef,
     pub keyring_secret: Option<Vec<u8>>,
     pub app_files: BTreeMap<String, Vec<u8>>,
@@ -72,15 +86,32 @@ pub fn default_live_keyring_ref() -> KeyringRef {
 }
 
 pub fn classify_profile(
-    _profile_store: &ProfileStore,
-    _name: &str,
+    profile_store: &ProfileStore,
+    name: &str,
     auth_method: AuthMethod,
     _credential_backend: CredentialBackend,
 ) -> Result<AntigravityAuthClassification> {
     if auth_method != AuthMethod::OAuth {
         bail!("Antigravity currently supports OAuth profiles only");
     }
-    Ok(AntigravityAuthClassification::OauthSharedLiveKeyring)
+    Ok(match read_profile_credential_source(profile_store, name)? {
+        LiveCredentialSource::Keyring => AntigravityAuthClassification::OauthSharedLiveKeyring,
+        LiveCredentialSource::HeadlessFile => {
+            AntigravityAuthClassification::OauthSharedLiveHeadlessFile
+        }
+    })
+}
+
+pub(crate) fn profile_credential_file(
+    profile_store: &ProfileStore,
+    profile_name: &str,
+) -> Result<&'static str> {
+    Ok(
+        match read_profile_credential_source(profile_store, profile_name)? {
+            LiveCredentialSource::Keyring => SECRET_FILE,
+            LiveCredentialSource::HeadlessFile => STORED_HEADLESS_TOKEN_FILE,
+        },
+    )
 }
 
 pub fn read_managed_secret(
@@ -124,10 +155,13 @@ pub fn persist_managed_secret(
 
 pub fn live_credentials_snapshot_for_import(user_home: &Path) -> Result<Option<LiveSnapshot>> {
     let snapshot = capture_live_snapshot(user_home)?;
-    if snapshot.keyring_secret.is_none()
-        && snapshot.app_files.is_empty()
-        && snapshot.shared_files.is_empty()
-    {
+    let has_credential = match snapshot.credential_source {
+        LiveCredentialSource::Keyring => snapshot.keyring_secret.is_some(),
+        LiveCredentialSource::HeadlessFile => {
+            headless_token_from_files(&snapshot.app_files).is_some()
+        }
+    };
+    if !has_credential {
         return Ok(None);
     }
     Ok(Some(snapshot))
@@ -135,15 +169,81 @@ pub fn live_credentials_snapshot_for_import(user_home: &Path) -> Result<Option<L
 
 pub fn capture_live_snapshot(user_home: &Path) -> Result<LiveSnapshot> {
     let keyring_ref = default_live_keyring_ref();
-    Ok(LiveSnapshot {
-        keyring_secret: super::system_keyring::read_generic_password(
+    let app_files = read_live_dir(&live_app_dir(user_home))?;
+    let (credential_source, keyring_secret) =
+        match super::system_keyring::read_generic_password_state(
             &keyring_ref.service,
             Some(&keyring_ref.account),
-        )?,
+        )? {
+            super::system_keyring::GenericPasswordRead::Found(secret) => {
+                (LiveCredentialSource::Keyring, Some(secret))
+            }
+            super::system_keyring::GenericPasswordRead::Missing => {
+                (LiveCredentialSource::Keyring, None)
+            }
+            super::system_keyring::GenericPasswordRead::Unavailable(detail) => {
+                if !cfg!(target_os = "linux") {
+                    bail!(detail);
+                }
+                validate_live_headless_token(user_home, &app_files)?;
+                (LiveCredentialSource::HeadlessFile, None)
+            }
+        };
+    Ok(LiveSnapshot {
+        credential_source,
+        keyring_secret,
         keyring_ref,
-        app_files: read_live_dir(&live_app_dir(user_home))?,
+        app_files,
         shared_files: read_live_dir(&live_shared_dir(user_home))?,
     })
+}
+
+fn headless_token_from_files(files_map: &BTreeMap<String, Vec<u8>>) -> Option<&[u8]> {
+    files_map
+        .get(HEADLESS_TOKEN_FILE)
+        .filter(|bytes| !bytes.is_empty())
+        .map(Vec::as_slice)
+}
+
+fn validate_live_headless_token(
+    user_home: &Path,
+    app_files: &BTreeMap<String, Vec<u8>>,
+) -> Result<()> {
+    let path = live_app_dir(user_home).join(HEADLESS_TOKEN_FILE);
+    if !path.exists() {
+        return Ok(());
+    }
+    let metadata = fs::symlink_metadata(&path)
+        .with_context(|| format!("could not stat {}", path.display()))?;
+    if metadata.file_type().is_symlink() || !metadata.file_type().is_file() {
+        bail!(
+            "refusing Antigravity headless token that is not a regular file: {}",
+            path.display()
+        );
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+        let mode = metadata.permissions().mode() & 0o777;
+        if mode != 0o600 {
+            bail!(
+                "permissions on {} are too broad (got {:04o}, expected 0600)",
+                path.display(),
+                mode
+            );
+        }
+        if metadata.uid() != unsafe { libc::geteuid() } {
+            bail!(
+                "refusing Antigravity headless token not owned by the current user: {}",
+                path.display()
+            );
+        }
+    }
+    if headless_token_from_files(app_files).is_none() {
+        bail!("Antigravity headless token is empty: {}", path.display());
+    }
+    Ok(())
 }
 
 fn read_live_dir(dir: &Path) -> Result<BTreeMap<String, Vec<u8>>> {
@@ -206,14 +306,22 @@ fn write_profile_snapshot_inner(
     snapshot: &LiveSnapshot,
     overwrite_existing: bool,
 ) -> Result<()> {
-    if snapshot.keyring_secret.is_none() {
-        bail!("no Antigravity keyring credential found. Sign in with 'agy' first, then retry.");
-    }
+    let credential = match snapshot.credential_source {
+        LiveCredentialSource::Keyring => snapshot.keyring_secret.as_deref().with_context(|| {
+            "no Antigravity keyring credential found. Sign in with 'agy' first, then retry."
+        })?,
+        LiveCredentialSource::HeadlessFile => {
+            validate_headless_profile_backend(backend)?;
+            headless_token_from_files(&snapshot.app_files).with_context(|| {
+                "no Antigravity headless token found. Sign in with 'agy' first, then retry."
+            })?
+        }
+    };
 
     if let Some(existing) = identity::existing_antigravity_oauth_profile_for_live_secret(
         profile_store,
         config_store,
-        snapshot.keyring_secret.as_deref(),
+        Some(credential),
     )? {
         if existing != profile_name {
             bail!(
@@ -224,9 +332,10 @@ fn write_profile_snapshot_inner(
         }
     }
 
-    persist_profile_keyring_ref(profile_store, profile_name, &snapshot.keyring_ref)?;
-    if let Some(secret) = snapshot.keyring_secret.as_deref() {
-        persist_managed_secret(profile_store, profile_name, backend, secret)?;
+    persist_profile_credential_source(profile_store, profile_name, snapshot.credential_source)?;
+    if snapshot.credential_source == LiveCredentialSource::Keyring {
+        persist_profile_keyring_ref(profile_store, profile_name, &snapshot.keyring_ref)?;
+        persist_managed_secret(profile_store, profile_name, backend, credential)?;
     }
 
     clear_profile_subtree(profile_store, profile_name, APP_PREFIX)?;
@@ -238,6 +347,11 @@ fn write_profile_snapshot_inner(
         SHARED_PREFIX,
         &snapshot.shared_files,
     )?;
+
+    if snapshot.credential_source == LiveCredentialSource::HeadlessFile {
+        remove_optional_profile_file(profile_store, profile_name, KEYRING_METADATA_FILE)?;
+        remove_optional_profile_file(profile_store, profile_name, SECRET_FILE)?;
+    }
 
     identity::ensure_unique_oauth_identity(
         profile_store,
@@ -258,7 +372,42 @@ fn write_profile_snapshot_inner(
     } else {
         config_store.add_profile(Tool::Antigravity, profile_name, meta)?;
     }
+    if snapshot.credential_source == LiveCredentialSource::HeadlessFile {
+        let _ = secure_store::delete_profile_secret(Tool::Antigravity, profile_name);
+    }
     Ok(())
+}
+
+fn validate_headless_profile_backend(backend: CredentialBackend) -> Result<()> {
+    if !cfg!(target_os = "linux") {
+        bail!("Antigravity headless file authentication is supported on Linux only");
+    }
+    if backend != CredentialBackend::File {
+        bail!(
+            "Antigravity's native headless file authentication requires --credential-backend file"
+        );
+    }
+    Ok(())
+}
+
+fn remove_optional_profile_file(
+    profile_store: &ProfileStore,
+    profile_name: &str,
+    filename: &str,
+) -> Result<()> {
+    let path = profile_store
+        .profile_dir(Tool::Antigravity, profile_name)
+        .join(filename);
+    if !path.exists() {
+        return Ok(());
+    }
+    if path.is_symlink() || !path.is_file() {
+        bail!(
+            "refusing to remove non-regular profile file: {}",
+            path.display()
+        );
+    }
+    fs::remove_file(&path).with_context(|| format!("could not delete {}", path.display()))
 }
 
 fn clear_profile_subtree(
@@ -294,21 +443,69 @@ pub fn apply_live_credentials(
     backend: CredentialBackend,
     user_home: &Path,
 ) -> Result<()> {
-    let keyring_ref = read_profile_keyring_ref(profile_store, profile_name)?;
-    let Some(secret) = read_managed_secret(profile_store, profile_name, backend)? else {
-        bail!(
-            "managed Antigravity credential is missing for profile '{}'",
-            profile_name
-        );
-    };
+    match read_profile_credential_source(profile_store, profile_name)? {
+        LiveCredentialSource::Keyring => {
+            let keyring_ref = read_profile_keyring_ref(profile_store, profile_name)?;
+            let Some(secret) = read_managed_secret(profile_store, profile_name, backend)? else {
+                bail!(
+                    "managed Antigravity credential is missing for profile '{}'",
+                    profile_name
+                );
+            };
+            super::system_keyring::read_generic_password(
+                &keyring_ref.service,
+                Some(&keyring_ref.account),
+            )
+            .context(
+                "cannot apply an Antigravity keyring-backed profile while the OS keyring is unavailable",
+            )?;
 
-    let changes = build_apply_transaction(profile_store, profile_name, user_home)?;
-    crate::live_apply::apply_transaction(changes)?;
-    super::system_keyring::upsert_generic_password(
+            let changes = build_apply_transaction(profile_store, profile_name, user_home)?;
+            crate::live_apply::apply_transaction(changes)?;
+            super::system_keyring::upsert_generic_password(
+                &keyring_ref.service,
+                &keyring_ref.account,
+                &secret,
+            )
+        }
+        LiveCredentialSource::HeadlessFile => {
+            validate_headless_profile_backend(backend)?;
+            ensure_keyring_unavailable_for_headless_profile()?;
+            let token_path = profile_store
+                .profile_dir(Tool::Antigravity, profile_name)
+                .join(STORED_HEADLESS_TOKEN_FILE);
+            profile_store.check_permissions(&token_path)?;
+            let token = profile_store.read_file(
+                Tool::Antigravity,
+                profile_name,
+                STORED_HEADLESS_TOKEN_FILE,
+            )?;
+            if token.is_empty() {
+                bail!(
+                    "managed Antigravity headless token is empty for profile '{}'",
+                    profile_name
+                );
+            }
+            let changes = build_apply_transaction(profile_store, profile_name, user_home)?;
+            crate::live_apply::apply_transaction(changes)
+        }
+    }
+}
+
+fn ensure_keyring_unavailable_for_headless_profile() -> Result<()> {
+    let keyring_ref = default_live_keyring_ref();
+    match super::system_keyring::read_generic_password_state(
         &keyring_ref.service,
-        &keyring_ref.account,
-        &secret,
-    )
+        Some(&keyring_ref.account),
+    )? {
+        super::system_keyring::GenericPasswordRead::Unavailable(_) => Ok(()),
+        super::system_keyring::GenericPasswordRead::Found(_)
+        | super::system_keyring::GenericPasswordRead::Missing => {
+            bail!(
+                "refusing to apply an Antigravity headless-file profile while the OS keyring is accessible; capture or use a keyring-backed profile on this session"
+            )
+        }
+    }
 }
 
 fn build_apply_transaction(
@@ -382,14 +579,25 @@ pub fn live_state_matches(
     backend: CredentialBackend,
     user_home: &Path,
 ) -> Result<bool> {
-    let keyring_ref = read_profile_keyring_ref(profile_store, profile_name)?;
-    let managed_secret = read_managed_secret(profile_store, profile_name, backend)?;
-    let live_secret = super::system_keyring::read_generic_password(
-        &keyring_ref.service,
-        Some(&keyring_ref.account),
-    )?;
-    if managed_secret != live_secret {
-        return Ok(false);
+    match read_profile_credential_source(profile_store, profile_name)? {
+        LiveCredentialSource::Keyring => {
+            let keyring_ref = read_profile_keyring_ref(profile_store, profile_name)?;
+            let managed_secret = read_managed_secret(profile_store, profile_name, backend)?;
+            let live_secret = super::system_keyring::read_generic_password(
+                &keyring_ref.service,
+                Some(&keyring_ref.account),
+            )?;
+            if managed_secret != live_secret {
+                return Ok(false);
+            }
+        }
+        LiveCredentialSource::HeadlessFile => {
+            validate_headless_profile_backend(backend)?;
+            if ensure_keyring_unavailable_for_headless_profile().is_err() {
+                return Ok(false);
+            }
+            validate_live_headless_token(user_home, &read_live_dir(&live_app_dir(user_home))?)?;
+        }
     }
     Ok(profile_tree_map(profile_store, profile_name, APP_PREFIX)?
         == read_live_dir(&live_app_dir(user_home))?
@@ -406,19 +614,36 @@ pub fn sync_profile_from_live_if_same_identity(
     let Some(snapshot) = live_credentials_snapshot_for_import(user_home)? else {
         return Ok(false);
     };
-    let Some(secret) = snapshot.keyring_secret.as_deref() else {
+    let profile_source = read_profile_credential_source(profile_store, profile_name)?;
+    if snapshot.credential_source != profile_source {
         return Ok(false);
     };
-    let Some(managed_secret) = read_managed_secret(profile_store, profile_name, backend)? else {
+    let live_credential = match snapshot.credential_source {
+        LiveCredentialSource::Keyring => snapshot.keyring_secret.as_deref(),
+        LiveCredentialSource::HeadlessFile => headless_token_from_files(&snapshot.app_files),
+    };
+    let managed_credential = match profile_source {
+        LiveCredentialSource::Keyring => read_managed_secret(profile_store, profile_name, backend)?,
+        LiveCredentialSource::HeadlessFile => Some(profile_store.read_file(
+            Tool::Antigravity,
+            profile_name,
+            STORED_HEADLESS_TOKEN_FILE,
+        )?),
+    };
+    let (Some(live_credential), Some(managed_credential)) = (live_credential, managed_credential)
+    else {
         return Ok(false);
     };
-    let managed_identity = identity::resolve_identity_from_json_bytes(&managed_secret)?;
-    let live_identity = identity::resolve_identity_from_json_bytes(secret)?;
+    let managed_identity =
+        identity::resolve_antigravity_identity_from_json_bytes(&managed_credential)?;
+    let live_identity = identity::resolve_antigravity_identity_from_json_bytes(live_credential)?;
     if managed_identity.is_none() || managed_identity != live_identity {
         return Ok(false);
     }
-    persist_profile_keyring_ref(profile_store, profile_name, &snapshot.keyring_ref)?;
-    persist_managed_secret(profile_store, profile_name, backend, secret)?;
+    if profile_source == LiveCredentialSource::Keyring {
+        persist_profile_keyring_ref(profile_store, profile_name, &snapshot.keyring_ref)?;
+        persist_managed_secret(profile_store, profile_name, backend, live_credential)?;
+    }
     clear_profile_subtree(profile_store, profile_name, APP_PREFIX)?;
     clear_profile_subtree(profile_store, profile_name, SHARED_PREFIX)?;
     persist_profile_tree(profile_store, profile_name, APP_PREFIX, &snapshot.app_files)?;
@@ -457,7 +682,8 @@ pub fn add_oauth_with_backend(
         );
     }
     let after = capture_live_snapshot(&user_home)?;
-    if before.keyring_secret == after.keyring_secret
+    if before.credential_source == after.credential_source
+        && before.keyring_secret == after.keyring_secret
         && before.app_files == after.app_files
         && before.shared_files == after.shared_files
     {
@@ -513,16 +739,19 @@ pub fn restore_snapshot_to_live(snapshot: &LiveSnapshot, user_home: &Path) -> Re
         changes
     };
     crate::live_apply::apply_transaction(changes)?;
-    match snapshot.keyring_secret.as_deref() {
-        Some(secret) => super::system_keyring::upsert_generic_password(
-            &snapshot.keyring_ref.service,
-            &snapshot.keyring_ref.account,
-            secret,
-        ),
-        None => super::system_keyring::delete_generic_password(
-            &snapshot.keyring_ref.service,
-            &snapshot.keyring_ref.account,
-        ),
+    match snapshot.credential_source {
+        LiveCredentialSource::HeadlessFile => Ok(()),
+        LiveCredentialSource::Keyring => match snapshot.keyring_secret.as_deref() {
+            Some(secret) => super::system_keyring::upsert_generic_password(
+                &snapshot.keyring_ref.service,
+                &snapshot.keyring_ref.account,
+                secret,
+            ),
+            None => super::system_keyring::delete_generic_password(
+                &snapshot.keyring_ref.service,
+                &snapshot.keyring_ref.account,
+            ),
+        },
     }
 }
 
@@ -540,6 +769,30 @@ fn persist_profile_keyring_ref(
         KEYRING_METADATA_FILE,
         &bytes,
     )
+}
+
+fn persist_profile_credential_source(
+    profile_store: &ProfileStore,
+    profile_name: &str,
+    source: LiveCredentialSource,
+) -> Result<()> {
+    let bytes =
+        serde_json::to_vec(&source).context("could not serialize Antigravity auth source")?;
+    profile_store.write_file(Tool::Antigravity, profile_name, AUTH_SOURCE_FILE, &bytes)
+}
+
+fn read_profile_credential_source(
+    profile_store: &ProfileStore,
+    profile_name: &str,
+) -> Result<LiveCredentialSource> {
+    let path = profile_store
+        .profile_dir(Tool::Antigravity, profile_name)
+        .join(AUTH_SOURCE_FILE);
+    if !path.exists() {
+        return Ok(LiveCredentialSource::Keyring);
+    }
+    let bytes = profile_store.read_file(Tool::Antigravity, profile_name, AUTH_SOURCE_FILE)?;
+    serde_json::from_slice(&bytes).context("could not parse Antigravity auth source metadata")
 }
 
 pub fn read_profile_keyring_ref(
@@ -860,6 +1113,7 @@ mod tests {
 
         restore_snapshot_to_live(
             &LiveSnapshot {
+                credential_source: LiveCredentialSource::Keyring,
                 keyring_ref: default_live_keyring_ref(),
                 keyring_secret: None,
                 app_files: BTreeMap::new(),

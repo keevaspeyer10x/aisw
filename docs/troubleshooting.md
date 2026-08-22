@@ -152,6 +152,8 @@ aisw --non-interactive add codex ci --api-key "$OPENAI_API_KEY"
 
 `aisw` automatically falls back to `0600` file-backed storage when the keyring is not available. Run `aisw doctor` to confirm which backend is active.
 
+For Antigravity 1.1.3+, `aisw add antigravity <name> --from-live` can capture Antigravity's native headless token after you sign in with `agy`. The live token must be an owner-owned regular file with `0600` permissions. Headless-file profiles deliberately refuse to switch if a usable OS keyring later appears; recapture that account as a keyring-backed profile in the desktop session instead.
+
 **Fix (desktop):**
 
 Start the keyring daemon:

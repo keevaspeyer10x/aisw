@@ -11,6 +11,7 @@ const CLAUDE_OAUTH_ACCOUNT_FILE: &str = "oauth-account.json";
 const CODEX_AUTH_FILE: &str = "auth.json";
 const GEMINI_OAUTH_FILES: &[&str] = &["settings.json", "oauth_creds.json"];
 const ANTIGRAVITY_SECRET_FILE: &str = "keyring-secret.json";
+const ANTIGRAVITY_HEADLESS_TOKEN_FILE: &str = "app/antigravity-oauth-token";
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum OAuthIdentity {
@@ -239,7 +240,7 @@ fn resolve_oauth_identity(
             tool,
             profile_name,
             backend,
-            &[ANTIGRAVITY_SECRET_FILE],
+            &[ANTIGRAVITY_SECRET_FILE, ANTIGRAVITY_HEADLESS_TOKEN_FILE],
         ),
     }
 }
@@ -297,6 +298,13 @@ fn read_optional_profile_file(
 pub(crate) fn resolve_identity_from_json_bytes(bytes: &[u8]) -> Result<Option<String>> {
     Ok(
         resolve_identity_from_json_bytes_for_tool(Tool::Codex, bytes)?
+            .map(|identity| identity.display().to_owned()),
+    )
+}
+
+pub(crate) fn resolve_antigravity_identity_from_json_bytes(bytes: &[u8]) -> Result<Option<String>> {
+    Ok(
+        resolve_identity_from_json_bytes_for_tool(Tool::Antigravity, bytes)?
             .map(|identity| identity.display().to_owned()),
     )
 }
