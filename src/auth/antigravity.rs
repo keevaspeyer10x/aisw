@@ -906,6 +906,13 @@ pub fn restore_live_state_after_oauth_add(
 }
 
 pub fn restore_snapshot_to_live(snapshot: &LiveSnapshot, user_home: &Path) -> Result<()> {
+    if snapshot.credential_source == LiveCredentialSource::HeadlessFile {
+        if !cfg!(target_os = "linux") {
+            bail!("Antigravity headless file authentication is supported on Linux only");
+        }
+        ensure_keyring_unavailable_for_headless_profile()?;
+    }
+
     let changes = {
         let mut app_files = snapshot.app_files.clone();
         if snapshot.credential_source == LiveCredentialSource::Keyring {
@@ -1480,6 +1487,47 @@ mod tests {
         )
         .unwrap()
         .is_none());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn headless_restore_refuses_accessible_keyring_before_file_mutation() {
+        let _g = crate::SPAWN_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let temp = tempdir().unwrap();
+        let _keyring = EnvVarGuard::set("AISW_KEYRING_TEST_DIR", temp.path());
+        let user_home = temp.path().join("user");
+        fs::create_dir_all(&user_home).unwrap();
+        write_live_state(&user_home, br#"{"email":"work@example.com"}"#);
+        let before_app = read_live_dir(&live_app_dir(&user_home)).unwrap();
+        let before_shared = read_live_dir(&live_shared_dir(&user_home)).unwrap();
+
+        let mut app_files = BTreeMap::new();
+        app_files.insert(
+            HEADLESS_TOKEN_FILE.to_owned(),
+            br#"{"email":"other@example.com"}"#.to_vec(),
+        );
+        app_files.insert("settings.json".to_owned(), br#"{"theme":"new"}"#.to_vec());
+        let snapshot = LiveSnapshot {
+            credential_source: LiveCredentialSource::HeadlessFile,
+            keyring_ref: default_live_keyring_ref(),
+            keyring_secret: None,
+            app_files,
+            shared_files: BTreeMap::new(),
+        };
+
+        let error = restore_snapshot_to_live(&snapshot, &user_home).unwrap_err();
+
+        assert!(error
+            .to_string()
+            .contains("refusing to apply an Antigravity headless-file profile"));
+        assert_eq!(
+            read_live_dir(&live_app_dir(&user_home)).unwrap(),
+            before_app
+        );
+        assert_eq!(
+            read_live_dir(&live_shared_dir(&user_home)).unwrap(),
+            before_shared
+        );
     }
 
     #[test]
