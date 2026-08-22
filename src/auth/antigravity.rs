@@ -269,6 +269,18 @@ pub fn write_profile_snapshot(
     snapshot: &LiveSnapshot,
     overwrite_existing: bool,
 ) -> Result<()> {
+    let existing_source_marker = if overwrite_existing {
+        let path = profile_store
+            .profile_dir(Tool::Antigravity, profile_name)
+            .join(AUTH_SOURCE_FILE);
+        if path.exists() {
+            Some(profile_store.read_file(Tool::Antigravity, profile_name, AUTH_SOURCE_FILE)?)
+        } else {
+            None
+        }
+    } else {
+        None
+    };
     let existing_secret = if overwrite_existing {
         read_managed_secret(profile_store, profile_name, backend)?
     } else {
@@ -283,6 +295,21 @@ pub fn write_profile_snapshot(
         snapshot,
         overwrite_existing,
     );
+    if result.is_err() && overwrite_existing {
+        match existing_source_marker {
+            Some(marker) => {
+                let _ = profile_store.write_file(
+                    Tool::Antigravity,
+                    profile_name,
+                    AUTH_SOURCE_FILE,
+                    &marker,
+                );
+            }
+            None => {
+                let _ = remove_optional_profile_file(profile_store, profile_name, AUTH_SOURCE_FILE);
+            }
+        }
+    }
     if result.is_err() && overwrite_existing && backend == CredentialBackend::SystemKeyring {
         match existing_secret {
             Some(secret) => {
@@ -1049,6 +1076,53 @@ mod tests {
                 .unwrap()
                 .unwrap(),
             br#"{"email":"work@example.com"}"#
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn failed_overwrite_restores_the_previous_credential_source_marker() {
+        let temp = tempdir().unwrap();
+        let home = temp.path().join("home");
+        fs::create_dir_all(&home).unwrap();
+        let profile_store = ProfileStore::new(&home);
+        let config_store = ConfigStore::new(&home);
+
+        profile_store.create(Tool::Antigravity, "work").unwrap();
+        persist_profile_credential_source(&profile_store, "work", LiveCredentialSource::Keyring)
+            .unwrap();
+        profile_store
+            .write_file(Tool::Antigravity, "work", APP_PREFIX, b"not-a-directory")
+            .unwrap();
+
+        let mut app_files = BTreeMap::new();
+        app_files.insert(
+            HEADLESS_TOKEN_FILE.to_owned(),
+            br#"{"email":"new@example.com"}"#.to_vec(),
+        );
+        let snapshot = LiveSnapshot {
+            credential_source: LiveCredentialSource::HeadlessFile,
+            keyring_ref: default_live_keyring_ref(),
+            keyring_secret: None,
+            app_files,
+            shared_files: BTreeMap::new(),
+        };
+
+        let error = write_profile_snapshot(
+            &profile_store,
+            &config_store,
+            "work",
+            None,
+            CredentialBackend::File,
+            &snapshot,
+            true,
+        )
+        .unwrap_err();
+
+        assert!(error.to_string().contains("could not delete"));
+        assert_eq!(
+            read_profile_credential_source(&profile_store, "work").unwrap(),
+            LiveCredentialSource::Keyring
         );
     }
 
