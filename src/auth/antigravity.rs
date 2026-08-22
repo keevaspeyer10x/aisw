@@ -138,7 +138,7 @@ pub fn read_managed_secret(
             let path = profile_store
                 .profile_dir(Tool::Antigravity, profile_name)
                 .join(SECRET_FILE);
-            if !path.exists() {
+            if !optional_regular_profile_file(&path)? {
                 return Ok(None);
             }
             profile_store
@@ -536,16 +536,24 @@ fn remove_optional_profile_file(
     let path = profile_store
         .profile_dir(Tool::Antigravity, profile_name)
         .join(filename);
-    if !path.exists() {
+    if !optional_regular_profile_file(&path)? {
         return Ok(());
     }
-    if path.is_symlink() || !path.is_file() {
-        bail!(
-            "refusing to remove non-regular profile file: {}",
-            path.display()
-        );
-    }
     fs::remove_file(&path).with_context(|| format!("could not delete {}", path.display()))
+}
+
+fn optional_regular_profile_file(path: &Path) -> Result<bool> {
+    let metadata = match fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(error) => {
+            return Err(error).with_context(|| format!("could not stat {}", path.display()));
+        }
+    };
+    if !metadata.file_type().is_file() {
+        bail!("refusing non-regular profile file: {}", path.display());
+    }
+    Ok(true)
 }
 
 fn clear_profile_subtree(
@@ -793,7 +801,7 @@ pub fn sync_profile_from_live_if_same_identity(
             let token_path = profile_store
                 .profile_dir(Tool::Antigravity, profile_name)
                 .join(STORED_HEADLESS_TOKEN_FILE);
-            if token_path.exists() {
+            if optional_regular_profile_file(&token_path)? {
                 Some(profile_store.read_file(
                     Tool::Antigravity,
                     profile_name,
@@ -968,7 +976,7 @@ fn read_profile_credential_source(
     let path = profile_store
         .profile_dir(Tool::Antigravity, profile_name)
         .join(AUTH_SOURCE_FILE);
-    if !path.exists() {
+    if !optional_regular_profile_file(&path)? {
         return Ok(LiveCredentialSource::Keyring);
     }
     let bytes = profile_store.read_file(Tool::Antigravity, profile_name, AUTH_SOURCE_FILE)?;
@@ -1344,6 +1352,36 @@ mod tests {
             .profile_dir(Tool::Antigravity, "work")
             .join(STORED_HEADLESS_TOKEN_FILE)
             .exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn optional_profile_files_reject_dangling_symlinks() {
+        use std::os::unix::fs::symlink;
+
+        let temp = tempdir().unwrap();
+        let home = temp.path().join("home");
+        fs::create_dir_all(&home).unwrap();
+        let profile_store = ProfileStore::new(&home);
+        profile_store.create(Tool::Antigravity, "work").unwrap();
+        let profile_dir = profile_store.profile_dir(Tool::Antigravity, "work");
+
+        let auth_source = profile_dir.join(AUTH_SOURCE_FILE);
+        symlink("missing-auth-source.json", &auth_source).unwrap();
+        let source_error = read_profile_credential_source(&profile_store, "work").unwrap_err();
+        assert!(source_error
+            .to_string()
+            .contains("refusing non-regular profile file"));
+
+        fs::remove_file(&auth_source).unwrap();
+        let keyring_metadata = profile_dir.join(KEYRING_METADATA_FILE);
+        symlink("missing-keyring.json", &keyring_metadata).unwrap();
+        let removal_error =
+            remove_optional_profile_file(&profile_store, "work", KEYRING_METADATA_FILE)
+                .unwrap_err();
+        assert!(removal_error
+            .to_string()
+            .contains("refusing non-regular profile file"));
     }
 
     #[test]
