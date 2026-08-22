@@ -176,8 +176,13 @@ pub(crate) fn collect_status(
             let profiles = config.profiles_for(tool);
             let profile_meta = &profiles[name];
             let profile_dir = profile_store.profile_dir(tool, name);
-            let (creds, perms) =
-                check_profile_storage(&profile_dir, tool, name, profile_meta.credential_backend);
+            let (creds, perms) = check_profile_storage(
+                &profile_store,
+                &profile_dir,
+                tool,
+                name,
+                profile_meta.credential_backend,
+            );
 
             let auth = profiles
                 .get(name)
@@ -354,6 +359,7 @@ fn auth_label(method: AuthMethod) -> &'static str {
 /// credentials_present: at least one regular file exists in the dir.
 /// permissions_ok: all regular files have 0600 permissions (unix only).
 fn check_profile_storage(
+    profile_store: &ProfileStore,
     dir: &Path,
     tool: Tool,
     profile_name: &str,
@@ -361,6 +367,26 @@ fn check_profile_storage(
 ) -> (bool, bool) {
     if !dir.is_dir() {
         return (false, true);
+    }
+    if tool == Tool::Antigravity && credential_backend == CredentialBackend::File {
+        let Ok(filename) = auth::antigravity::profile_credential_file(profile_store, profile_name)
+        else {
+            return (false, false);
+        };
+        let path = dir.join(filename);
+        if path.is_symlink() || !path.is_file() {
+            return (false, true);
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let permissions_ok = std::fs::metadata(&path)
+                .map(|meta| meta.permissions().mode() & 0o777 == 0o600)
+                .unwrap_or(false);
+            return (true, permissions_ok);
+        }
+        #[cfg(not(unix))]
+        return (true, true);
     }
     let Ok(entries) = std::fs::read_dir(dir) else {
         return (false, true);

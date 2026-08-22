@@ -123,16 +123,16 @@ Notes:
 - `--from-live` always activates the profile because those credentials are already live.
 - `--from-live --yes` overwrites an existing profile in place; the existing entry is not removed until capture succeeds.
 - For Codex ChatGPT-managed auth, `--from-live` is a bootstrap import, not a durable interchangeable account bundle.
-- For Antigravity, `--from-live` captures the current shared live keyring-backed session plus the documented Antigravity config roots.
+- For Antigravity, `--from-live` captures the current shared live keyring session or native headless-Linux file session plus the documented Antigravity config roots.
 - When OAuth identity can be resolved, `add` blocks creating a duplicate profile for an already-stored account.
 - `--credential-backend` affects the managed `aisw` profile only. It does not force the upstream CLI's live auth backend.
-- Gemini supports only `file`. Claude, Codex, and Antigravity support `file` and `system-keyring`. Stored config and status output use `system_keyring`.
+- Gemini supports only `file`. Claude, Codex, and keyring-backed Antigravity profiles support `file` and `system-keyring`; native headless-Linux Antigravity profiles require `file`. Stored config and status output use `system_keyring`.
 
 Live credential locations by tool:
 - Claude: `~/.claude/.credentials.json` or the macOS Keychain
 - Codex: `~/.codex/auth.json` or the OS keyring
 - Gemini: `~/.gemini/.env` (API key) or OAuth files in `~/.gemini/`
-- Antigravity: live OS keyring auth plus config/state under `~/.gemini/antigravity-cli/` and `~/.gemini/config/`
+- Antigravity: live OS keyring auth, or native headless token file on Linux, plus config/state under `~/.gemini/antigravity-cli/` and `~/.gemini/config/`
 
 ```sh
 aisw add claude work --api-key "$ANTHROPIC_API_KEY"

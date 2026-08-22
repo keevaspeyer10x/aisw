@@ -25,7 +25,7 @@ description: Claude Code, Codex CLI, Gemini CLI, and Antigravity CLI support mat
 | Claude Code | `CLAUDE_CONFIG_DIR` set to profile directory when the install supports profile-owned auth | `CLAUDE_CONFIG_DIR` unset |
 | Codex CLI | `CODEX_HOME` set to profile directory | `CODEX_HOME` unset for API-key profiles only |
 | Gemini CLI | Profile files applied to `~/.gemini/` | Not supported |
-| Antigravity CLI | Not supported | Shared live keyring-backed auth and `~/.gemini` config roots restored transactionally |
+| Antigravity CLI | Not supported | Shared live keyring or native headless-file auth and `~/.gemini` config roots restored transactionally |
 
 In `isolated` mode, the tool reads config, history, and extensions from the profile-specific directory. In `shared` mode, the tool reads its standard config directory. Credentials are applied to the live location in both modes; state mode only controls which config directory the tool reads.
 
@@ -35,7 +35,7 @@ For Claude OAuth, isolated mode is intentionally blocked only when Claude is usi
 
 Gemini does not support `shared` mode because its auth state and broader local state (settings, session history, MCP configs) are tightly coupled under `~/.gemini/`. Separating them is not safely possible without risking session corruption.
 
-Antigravity does not currently expose a documented per-profile auth/data root like `CODEX_HOME` or `CLAUDE_CONFIG_DIR`. `aisw` therefore supports Antigravity through shared live switching: it restores the live OS keyring credential plus the documented `~/.gemini/antigravity-cli/` and `~/.gemini/config/` trees for the selected profile.
+Antigravity does not currently expose a documented per-profile auth/data root like `CODEX_HOME` or `CLAUDE_CONFIG_DIR`. `aisw` therefore supports Antigravity through shared live switching: it restores the exact captured live auth source plus the documented `~/.gemini/antigravity-cli/` and `~/.gemini/config/` trees for the selected profile.
 
 ## Credential storage by tool and platform
 
@@ -99,11 +99,11 @@ API key profiles store a `.env` file containing `GEMINI_API_KEY=<key>`. This is 
 
 ### Antigravity CLI
 
-- Live auth: OS-native keyring entry (`service=gemini`, `account=antigravity`) as observed in upstream issue reports and docs-aligned behavior.
+- Live auth: OS-native keyring entry (`service=gemini`, `account=antigravity`), or `~/.gemini/antigravity-cli/antigravity-oauth-token` when Antigravity natively bypasses the keyring on headless Linux.
 - Live config/state: `~/.gemini/antigravity-cli/` and `~/.gemini/config/`
-- `--from-live`: captures the current live keyring-backed session plus both documented config roots.
-- Interactive OAuth: launches `agy`, captures the resulting live keyring/config state, and restores the prior live state unless `--set-active` is requested.
-- No API-key path in `aisw` because upstream Antigravity docs currently describe OAuth/keyring auth, not API-key profile auth.
+- `--from-live`: captures the current live auth source plus both documented config roots.
+- Interactive OAuth: launches `agy`, captures the resulting live auth/config state, and restores the prior live state unless `--set-active` is requested.
+- No API-key path in `aisw` because Antigravity exposes OAuth sessions, not API-key profile auth.
 - No `--state-mode` support because upstream does not currently document an isolated per-profile auth or data root.
 
 ## Auth backend support matrix
@@ -119,6 +119,7 @@ API key profiles store a `.env` file containing `GEMINI_API_KEY=<key>`. This is 
 | Gemini CLI | System keyring | Not supported | Not supported | Gemini does not use keyring for credentials |
 | Antigravity CLI | File-backed managed profile + live OS keyring apply | Supported | Supported | Stores captured secret in the profile, then restores it into the live keyring on switch |
 | Antigravity CLI | System keyring-backed managed profile | Supported | Supported | Stores the captured live keyring secret in `aisw`'s managed keyring backend |
+| Antigravity CLI | Native headless file auth | Supported on Linux | Supported on Linux | Requires an owner-owned `0600` token, uses the managed file backend, and refuses apply whenever the OS keyring is accessible |
 
 **Fail-closed** means `aisw` refuses the operation rather than guessing. This applies specifically to Codex when the keyring account identifier cannot be read from the live credential store.
 

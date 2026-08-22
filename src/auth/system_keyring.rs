@@ -57,28 +57,74 @@ pub fn display_name() -> &'static str {
     }
 }
 
-pub fn read_generic_password(service: &str, account: Option<&str>) -> Result<Option<Vec<u8>>> {
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum GenericPasswordRead {
+    Found(Vec<u8>),
+    Missing,
+    Unavailable(String),
+}
+
+pub fn read_generic_password_state(
+    service: &str,
+    account: Option<&str>,
+) -> Result<GenericPasswordRead> {
+    if test_overrides::string("AISW_KEYRING_TEST_UNAVAILABLE").as_deref() == Some("1") {
+        return Ok(GenericPasswordRead::Unavailable(
+            "system keyring is unavailable (injected test condition)".to_owned(),
+        ));
+    }
     if let Some(root) = fake_root() {
-        return read_fake_password(&root, service, account);
+        return Ok(match read_fake_password(&root, service, account)? {
+            Some(secret) => GenericPasswordRead::Found(secret),
+            None => GenericPasswordRead::Missing,
+        });
     }
 
     if cfg!(target_os = "macos") && service != "aisw" {
-        return macos_keychain::read_generic_password(service, account);
+        return Ok(
+            match macos_keychain::read_generic_password(service, account)? {
+                Some(secret) => GenericPasswordRead::Found(secret),
+                None => GenericPasswordRead::Missing,
+            },
+        );
     }
 
     let Some(account) = resolve_account(service, account)? else {
-        return Ok(None);
+        return Ok(GenericPasswordRead::Missing);
     };
-    let entry = keyring::Entry::new(service, &account).map_err(|err| {
-        anyhow!("could not open system keyring entry for {service}/{account}: {err}")
-    })?;
+    let entry = match keyring::Entry::new(service, &account) {
+        Ok(entry) => entry,
+        Err(error) => return classify_keyring_read_error(service, &account, "open", error),
+    };
 
     match entry.get_password() {
-        Ok(secret) => Ok(Some(secret.into_bytes())),
-        Err(keyring::Error::NoEntry) => Ok(None),
-        Err(err) => Err(anyhow!(
-            "could not read system keyring entry for {service}/{account}: {err}"
-        )),
+        Ok(secret) => Ok(GenericPasswordRead::Found(secret.into_bytes())),
+        Err(keyring::Error::NoEntry) => Ok(GenericPasswordRead::Missing),
+        Err(error) => classify_keyring_read_error(service, &account, "read", error),
+    }
+}
+
+fn classify_keyring_read_error(
+    service: &str,
+    account: &str,
+    operation: &str,
+    error: keyring::Error,
+) -> Result<GenericPasswordRead> {
+    let detail =
+        format!("could not {operation} system keyring entry for {service}/{account}: {error}");
+    match error {
+        keyring::Error::PlatformFailure(_) | keyring::Error::NoStorageAccess(_) => {
+            Ok(GenericPasswordRead::Unavailable(detail))
+        }
+        _ => Err(anyhow!(detail)),
+    }
+}
+
+pub fn read_generic_password(service: &str, account: Option<&str>) -> Result<Option<Vec<u8>>> {
+    match read_generic_password_state(service, account)? {
+        GenericPasswordRead::Found(secret) => Ok(Some(secret)),
+        GenericPasswordRead::Missing => Ok(None),
+        GenericPasswordRead::Unavailable(detail) => Err(anyhow!(detail)),
     }
 }
 
@@ -418,5 +464,25 @@ mod tests {
             find_generic_password_account_with_candidates("Codex Auth", &candidates).unwrap(),
             Some("work@example.com".to_owned())
         );
+    }
+
+    #[test]
+    fn keyring_read_state_types_platform_unavailability_without_hiding_corruption() {
+        let unavailable = classify_keyring_read_error(
+            "gemini",
+            "antigravity",
+            "read",
+            keyring::Error::PlatformFailure(Box::new(std::io::Error::other("no service"))),
+        )
+        .unwrap();
+        assert!(matches!(unavailable, GenericPasswordRead::Unavailable(_)));
+
+        let corrupted = classify_keyring_read_error(
+            "gemini",
+            "antigravity",
+            "read",
+            keyring::Error::BadEncoding(vec![0xff]),
+        );
+        assert!(corrupted.is_err());
     }
 }

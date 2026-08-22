@@ -49,6 +49,21 @@ fn write_antigravity_live_state(env: &TestEnv, secret: &str) {
     fs::write(secret_path, secret).unwrap();
 }
 
+#[cfg(target_os = "linux")]
+fn write_antigravity_headless_live_state(env: &TestEnv, secret: &str) -> PathBuf {
+    use std::os::unix::fs::PermissionsExt;
+
+    let app_dir = env.fake_home.join(".gemini").join("antigravity-cli");
+    let shared_dir = env.fake_home.join(".gemini").join("config");
+    fs::create_dir_all(&app_dir).unwrap();
+    fs::create_dir_all(&shared_dir).unwrap();
+    fs::write(app_dir.join("settings.json"), br#"{"theme":"terminal"}"#).unwrap();
+    let token_path = app_dir.join("antigravity-oauth-token");
+    fs::write(&token_path, secret).unwrap();
+    fs::set_permissions(&token_path, fs::Permissions::from_mode(0o600)).unwrap();
+    token_path
+}
+
 fn write_config_only_profile(env: &TestEnv, tool: &str, profile: &str, backend: &str) {
     let mut config = serde_json::json!({
         "version": 2,
@@ -920,6 +935,107 @@ fn add_antigravity_from_live_succeeds_and_activates_profile() {
         fs::read_to_string(env.home_file("profiles/antigravity/work/keyring-secret.json")).unwrap(),
         ANTIGRAVITY_SECRET
     );
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn add_antigravity_from_live_captures_native_headless_file_when_keyring_is_unavailable() {
+    let env = TestEnv::new();
+    env.add_fake_tool("agy", "agy 1.1.18");
+    write_antigravity_headless_live_state(&env, ANTIGRAVITY_SECRET);
+
+    env.cmd()
+        .env("AISW_KEYRING_TEST_UNAVAILABLE", "1")
+        .args(["add", "antigravity", "work", "--from-live"])
+        .assert()
+        .success()
+        .stdout(contains("Added profile"))
+        .stdout(contains("oauth_shared_live_headless_file"));
+
+    assert_eq!(
+        fs::read_to_string(env.home_file("profiles/antigravity/work/auth-source.json")).unwrap(),
+        r#""headless_file""#
+    );
+    assert_eq!(
+        fs::read_to_string(env.home_file("profiles/antigravity/work/app/antigravity-oauth-token"))
+            .unwrap(),
+        ANTIGRAVITY_SECRET
+    );
+    assert!(!env
+        .home_file("profiles/antigravity/work/keyring-secret.json")
+        .exists());
+    assert!(!env
+        .home_file("profiles/antigravity/work/keyring.json")
+        .exists());
+    env.assert_file_is_600(&env.home_file("profiles/antigravity/work/app/antigravity-oauth-token"));
+
+    let status_output = env
+        .cmd()
+        .env("AISW_KEYRING_TEST_UNAVAILABLE", "1")
+        .args(["status", "--json"])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let status: serde_json::Value = serde_json::from_slice(&status_output).unwrap();
+    let antigravity = status
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|entry| entry["tool"] == "agy")
+        .unwrap();
+    assert_eq!(
+        antigravity["antigravity_auth_classification"],
+        "oauth_shared_live_headless_file"
+    );
+    assert_eq!(antigravity["active_profile_applied"], true);
+    assert_eq!(antigravity["credentials_present"], true);
+    assert_eq!(antigravity["permissions_ok"], true);
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn add_antigravity_headless_file_rejects_broad_live_token_permissions() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let env = TestEnv::new();
+    env.add_fake_tool("agy", "agy 1.1.18");
+    let token_path = write_antigravity_headless_live_state(&env, ANTIGRAVITY_SECRET);
+    fs::set_permissions(&token_path, fs::Permissions::from_mode(0o644)).unwrap();
+
+    env.cmd()
+        .env("AISW_KEYRING_TEST_UNAVAILABLE", "1")
+        .args(["add", "antigravity", "work", "--from-live"])
+        .assert()
+        .failure()
+        .stderr(contains("expected 0600"));
+
+    assert!(!env.home_file("profiles/antigravity/work").exists());
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn add_antigravity_headless_file_rejects_symlinked_live_token() {
+    use std::os::unix::fs::{symlink, PermissionsExt};
+
+    let env = TestEnv::new();
+    env.add_fake_tool("agy", "agy 1.1.18");
+    let app_dir = env.fake_home.join(".gemini").join("antigravity-cli");
+    fs::create_dir_all(&app_dir).unwrap();
+    let target = env.fake_home.join("token-target");
+    fs::write(&target, ANTIGRAVITY_SECRET).unwrap();
+    fs::set_permissions(&target, fs::Permissions::from_mode(0o600)).unwrap();
+    symlink(&target, app_dir.join("antigravity-oauth-token")).unwrap();
+
+    env.cmd()
+        .env("AISW_KEYRING_TEST_UNAVAILABLE", "1")
+        .args(["add", "antigravity", "work", "--from-live"])
+        .assert()
+        .failure()
+        .stderr(contains("not a regular file"));
+
+    assert!(!env.home_file("profiles/antigravity/work").exists());
 }
 
 #[test]

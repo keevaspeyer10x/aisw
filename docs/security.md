@@ -24,6 +24,8 @@ Credentials are stored under `~/.aisw/profiles/<tool>/<name>/`. The central conf
 
 For keyring-backed profiles, the sensitive credential bytes are stored in the OS keyring. The profile directory on disk contains a minimal reference or empty file; the actual secret lives in the keyring.
 
+Antigravity's native headless-Linux fallback is file-backed by the upstream client. `aisw` captures it only when the OS keyring cannot be read, requires the live token to be a regular owner-owned `0600` file, keeps the managed copy at `0600`, and refuses to apply that profile when the keyring is accessible. This prevents a stale keyring credential from silently overriding the selected file-backed account.
+
 ### File permissions
 
 All files written to `~/.aisw/profiles/` are created with `0600` permissions: readable and writable only by the owning user. This applies to API keys, OAuth tokens, and any captured tool state files.

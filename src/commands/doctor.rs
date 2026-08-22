@@ -195,9 +195,20 @@ pub fn check_profile_permissions(
             continue;
         }
 
+        let credential_filename = if tool == Tool::Antigravity {
+            match crate::auth::antigravity::profile_credential_file(profile_store, name) {
+                Ok(filename) => filename,
+                Err(error) => {
+                    results.push(CheckResult::fail(&check_name, error.to_string()));
+                    continue;
+                }
+            }
+        } else {
+            credentials_filename(tool)
+        };
         let cred_file = profile_store
             .profile_dir(tool, name)
-            .join(credentials_filename(tool));
+            .join(credential_filename);
 
         if !cred_file.exists() {
             results.push(CheckResult::fail(
@@ -598,6 +609,44 @@ mod tests {
         let results = check_profile_permissions(dir.path(), Tool::Claude, &cs, &ps);
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].status, CheckStatus::Pass);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn permissions_check_uses_antigravity_headless_token_as_credential_file() {
+        let dir = tempdir().unwrap();
+        let (ps, cs) = make_stores(dir.path());
+        ps.create(Tool::Antigravity, "work").unwrap();
+        ps.write_file(
+            Tool::Antigravity,
+            "work",
+            "auth-source.json",
+            br#""headless_file""#,
+        )
+        .unwrap();
+        ps.write_file(
+            Tool::Antigravity,
+            "work",
+            "app/antigravity-oauth-token",
+            br#"{"email":"work@example.com"}"#,
+        )
+        .unwrap();
+        cs.add_profile(
+            Tool::Antigravity,
+            "work",
+            ProfileMeta {
+                added_at: Utc::now(),
+                auth_method: AuthMethod::OAuth,
+                credential_backend: CredentialBackend::File,
+                label: None,
+            },
+        )
+        .unwrap();
+
+        let results = check_profile_permissions(dir.path(), Tool::Antigravity, &cs, &ps);
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].status, CheckStatus::Pass);
+        assert!(results[0].detail.contains("0600 ok"));
     }
 
     #[test]
