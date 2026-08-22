@@ -895,24 +895,25 @@ pub(crate) fn live_match_map(
 /// Best-effort: extract a human-readable account identity from stored credentials.
 /// Returns `None` silently when no identity is parseable — never fails the switch.
 fn extract_switch_identity(profile_store: &ProfileStore, tool: Tool, name: &str) -> Option<String> {
-    let cred_file = match tool {
-        Tool::Claude => ".credentials.json",
-        Tool::Codex => "auth.json",
-        Tool::Gemini => "oauth_creds.json",
-        Tool::Antigravity => "keyring-secret.json",
-    };
-
     let bytes = if tool == Tool::Antigravity {
-        profile_store
-            .read_file(tool, name, cred_file)
-            .or_else(|_| {
-                profile_store.read_file(tool, name, auth::antigravity::STORED_HEADLESS_TOKEN_FILE)
-            })
-            .or_else(|_| {
-                auth::secure_store::read_profile_secret(tool, name).map(|v| v.unwrap_or_default())
-            })
-            .ok()?
+        let credential_file =
+            auth::antigravity::profile_credential_file(profile_store, name).ok()?;
+        match profile_store.read_file(tool, name, credential_file) {
+            Ok(bytes) => bytes,
+            Err(_) if credential_file != auth::antigravity::STORED_HEADLESS_TOKEN_FILE => {
+                auth::secure_store::read_profile_secret(tool, name)
+                    .ok()?
+                    .unwrap_or_default()
+            }
+            Err(_) => return None,
+        }
     } else {
+        let cred_file = match tool {
+            Tool::Claude => ".credentials.json",
+            Tool::Codex => "auth.json",
+            Tool::Gemini => "oauth_creds.json",
+            Tool::Antigravity => unreachable!(),
+        };
         profile_store.read_file(tool, name, cred_file).ok()?
     };
     let v: serde_json::Value = serde_json::from_slice(&bytes).ok()?;
@@ -1458,6 +1459,37 @@ mod tests {
 
         let identity = extract_switch_identity(&ps, Tool::Codex, "work");
         assert_eq!(identity.as_deref(), Some("dev@example.com"));
+    }
+
+    #[test]
+    fn antigravity_switch_identity_does_not_fall_back_from_headless_source() {
+        let dir = tempdir().unwrap();
+        let ps = ProfileStore::new(dir.path());
+        ps.create(Tool::Antigravity, "work").unwrap();
+        ps.write_file(
+            Tool::Antigravity,
+            "work",
+            "auth-source.json",
+            br#""headless_file""#,
+        )
+        .unwrap();
+        ps.write_file(
+            Tool::Antigravity,
+            "work",
+            "keyring-secret.json",
+            br#"{"email":"stale@example.com"}"#,
+        )
+        .unwrap();
+        ps.write_file(
+            Tool::Antigravity,
+            "work",
+            auth::antigravity::STORED_HEADLESS_TOKEN_FILE,
+            br#"{"email":"current@example.com"}"#,
+        )
+        .unwrap();
+
+        let identity = extract_switch_identity(&ps, Tool::Antigravity, "work");
+        assert_eq!(identity.as_deref(), Some("current@example.com"));
     }
 
     #[test]

@@ -592,11 +592,17 @@ pub fn live_state_matches(
             }
         }
         LiveCredentialSource::HeadlessFile => {
-            validate_headless_profile_backend(backend)?;
+            if validate_headless_profile_backend(backend).is_err() {
+                return Ok(false);
+            }
             if ensure_keyring_unavailable_for_headless_profile().is_err() {
                 return Ok(false);
             }
-            validate_live_headless_token(user_home, &read_live_dir(&live_app_dir(user_home))?)?;
+            if validate_live_headless_token(user_home, &read_live_dir(&live_app_dir(user_home))?)
+                .is_err()
+            {
+                return Ok(false);
+            }
         }
     }
     Ok(profile_tree_map(profile_store, profile_name, APP_PREFIX)?
@@ -624,11 +630,20 @@ pub fn sync_profile_from_live_if_same_identity(
     };
     let managed_credential = match profile_source {
         LiveCredentialSource::Keyring => read_managed_secret(profile_store, profile_name, backend)?,
-        LiveCredentialSource::HeadlessFile => Some(profile_store.read_file(
-            Tool::Antigravity,
-            profile_name,
-            STORED_HEADLESS_TOKEN_FILE,
-        )?),
+        LiveCredentialSource::HeadlessFile => {
+            let token_path = profile_store
+                .profile_dir(Tool::Antigravity, profile_name)
+                .join(STORED_HEADLESS_TOKEN_FILE);
+            if token_path.exists() {
+                Some(profile_store.read_file(
+                    Tool::Antigravity,
+                    profile_name,
+                    STORED_HEADLESS_TOKEN_FILE,
+                )?)
+            } else {
+                None
+            }
+        }
     };
     let (Some(live_credential), Some(managed_credential)) = (live_credential, managed_credential)
     else {
@@ -1173,6 +1188,87 @@ mod tests {
             !live_state_matches(&profile_store, "work", CredentialBackend::File, &user_home)
                 .unwrap()
         );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn headless_live_state_mismatches_are_soft_failures() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let _g = crate::SPAWN_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let temp = tempdir().unwrap();
+        let _keyring = EnvVarGuard::set("AISW_KEYRING_TEST_UNAVAILABLE", Path::new("1"));
+        let home = temp.path().join("home");
+        let user_home = temp.path().join("user");
+        fs::create_dir_all(&home).unwrap();
+        fs::create_dir_all(live_app_dir(&user_home)).unwrap();
+
+        let token = br#"{"email":"work@example.com"}"#;
+        let token_path = live_app_dir(&user_home).join(HEADLESS_TOKEN_FILE);
+        fs::write(&token_path, token).unwrap();
+        fs::set_permissions(&token_path, fs::Permissions::from_mode(0o600)).unwrap();
+
+        let profile_store = ProfileStore::new(&home);
+        let config_store = ConfigStore::new(&home);
+        let snapshot = capture_live_snapshot(&user_home).unwrap();
+        profile_store.create(Tool::Antigravity, "work").unwrap();
+        write_profile_snapshot(
+            &profile_store,
+            &config_store,
+            "work",
+            None,
+            CredentialBackend::File,
+            &snapshot,
+            false,
+        )
+        .unwrap();
+
+        assert!(!live_state_matches(
+            &profile_store,
+            "work",
+            CredentialBackend::SystemKeyring,
+            &user_home,
+        )
+        .unwrap());
+
+        fs::set_permissions(&token_path, fs::Permissions::from_mode(0o644)).unwrap();
+        assert!(
+            !live_state_matches(&profile_store, "work", CredentialBackend::File, &user_home,)
+                .unwrap()
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn headless_sync_skips_when_managed_token_is_missing() {
+        let _g = crate::SPAWN_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let temp = tempdir().unwrap();
+        let _keyring = EnvVarGuard::set("AISW_KEYRING_TEST_UNAVAILABLE", Path::new("1"));
+        let home = temp.path().join("home");
+        let user_home = temp.path().join("user");
+        fs::create_dir_all(&home).unwrap();
+        fs::create_dir_all(live_app_dir(&user_home)).unwrap();
+
+        let token_path = live_app_dir(&user_home).join(HEADLESS_TOKEN_FILE);
+        fs::write(&token_path, br#"{"email":"work@example.com"}"#).unwrap();
+        files::set_permissions_600(&token_path).unwrap();
+
+        let profile_store = ProfileStore::new(&home);
+        profile_store.create(Tool::Antigravity, "work").unwrap();
+        persist_profile_credential_source(
+            &profile_store,
+            "work",
+            LiveCredentialSource::HeadlessFile,
+        )
+        .unwrap();
+
+        assert!(!sync_profile_from_live_if_same_identity(
+            &profile_store,
+            "work",
+            CredentialBackend::File,
+            &user_home,
+        )
+        .unwrap());
     }
 
     #[test]

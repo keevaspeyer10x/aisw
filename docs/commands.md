@@ -126,7 +126,7 @@ Notes:
 - For Antigravity, `--from-live` captures the current shared live keyring session or native headless-Linux file session plus the documented Antigravity config roots.
 - When OAuth identity can be resolved, `add` blocks creating a duplicate profile for an already-stored account.
 - `--credential-backend` affects the managed `aisw` profile only. It does not force the upstream CLI's live auth backend.
-- Gemini supports only `file`. Claude, Codex, and Antigravity support `file` and `system-keyring`. Stored config and status output use `system_keyring`.
+- Gemini supports only `file`. Claude, Codex, and keyring-backed Antigravity profiles support `file` and `system-keyring`; native headless-Linux Antigravity profiles require `file`. Stored config and status output use `system_keyring`.
 
 Live credential locations by tool:
 - Claude: `~/.claude/.credentials.json` or the macOS Keychain

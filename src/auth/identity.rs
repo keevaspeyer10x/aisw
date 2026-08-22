@@ -1,7 +1,7 @@
 use anyhow::{bail, Result};
 use serde_json::Value;
 
-use super::{claude, codex, gemini, secure_store};
+use super::{antigravity, claude, codex, gemini, secure_store};
 use crate::config::{AuthMethod, Config, ConfigStore, CredentialBackend};
 use crate::profile::ProfileStore;
 use crate::types::Tool;
@@ -10,8 +10,6 @@ const CLAUDE_CREDENTIALS_FILE: &str = ".credentials.json";
 const CLAUDE_OAUTH_ACCOUNT_FILE: &str = "oauth-account.json";
 const CODEX_AUTH_FILE: &str = "auth.json";
 const GEMINI_OAUTH_FILES: &[&str] = &["settings.json", "oauth_creds.json"];
-const ANTIGRAVITY_SECRET_FILE: &str = "keyring-secret.json";
-const ANTIGRAVITY_HEADLESS_TOKEN_FILE: &str = "app/antigravity-oauth-token";
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum OAuthIdentity {
@@ -235,13 +233,17 @@ fn resolve_oauth_identity(
             backend,
             GEMINI_OAUTH_FILES,
         ),
-        Tool::Antigravity => resolve_identity_from_optional_profile_files(
-            profile_store,
-            tool,
-            profile_name,
-            backend,
-            &[ANTIGRAVITY_SECRET_FILE, ANTIGRAVITY_HEADLESS_TOKEN_FILE],
-        ),
+        Tool::Antigravity => {
+            let credential_file =
+                antigravity::profile_credential_file(profile_store, profile_name)?;
+            resolve_identity_from_optional_profile_files(
+                profile_store,
+                tool,
+                profile_name,
+                backend,
+                &[credential_file],
+            )
+        }
     }
 }
 
@@ -630,6 +632,8 @@ impl OAuthIdentity {
 
 #[cfg(test)]
 mod tests {
+    use tempfile::tempdir;
+
     use super::*;
 
     #[test]
@@ -643,6 +647,48 @@ mod tests {
                 account_id: None,
                 fallback: None,
             })
+        );
+    }
+
+    #[test]
+    fn antigravity_identity_uses_the_declared_headless_source() {
+        let dir = tempdir().unwrap();
+        let profile_store = ProfileStore::new(dir.path());
+        profile_store.create(Tool::Antigravity, "work").unwrap();
+        profile_store
+            .write_file(
+                Tool::Antigravity,
+                "work",
+                "auth-source.json",
+                br#""headless_file""#,
+            )
+            .unwrap();
+        profile_store
+            .write_file(
+                Tool::Antigravity,
+                "work",
+                "keyring-secret.json",
+                br#"{"email":"stale@example.com"}"#,
+            )
+            .unwrap();
+        profile_store
+            .write_file(
+                Tool::Antigravity,
+                "work",
+                antigravity::STORED_HEADLESS_TOKEN_FILE,
+                br#"{"email":"current@example.com"}"#,
+            )
+            .unwrap();
+
+        assert_eq!(
+            resolve_oauth_identity(
+                &profile_store,
+                Tool::Antigravity,
+                "work",
+                CredentialBackend::File,
+            )
+            .unwrap(),
+            Some(OAuthIdentity::Generic("current@example.com".to_owned()))
         );
     }
 

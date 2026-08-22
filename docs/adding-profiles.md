@@ -79,7 +79,7 @@ For Codex personal access token sessions, `--from-live` is the current `aisw` pa
 
 For Claude OAuth, `--from-live` captures whatever Claude is currently using, but it does not upgrade a shared live session into an independently isolated auth owner. If the install still uses Claude's legacy shared Keychain credential, treat the imported profile as a captured shared-live session rather than as a durable isolated OAuth bundle.
 
-For Antigravity OAuth, both interactive add and `--from-live` operate on the same shared live upstream model: `aisw` stores the current auth source and documented Antigravity config roots, then restores them on switch. On headless Linux, Antigravity 1.1.3+ can bypass an unavailable keyring and use `antigravity-oauth-token`; `aisw` accepts that token only when it is a regular, owner-owned `0600` file and refuses the profile if the keyring later becomes accessible. Upstream does not currently document an isolated per-profile auth root or profile selector.
+For Antigravity OAuth, both interactive add and `--from-live` operate on the same shared live upstream model: `aisw` stores the current auth source and documented Antigravity config roots, then restores either that OS-keyring credential or that validated headless token-file source on switch. On headless Linux, Antigravity 1.1.3+ can bypass an unavailable keyring and use `antigravity-oauth-token`; `aisw` rejects missing or empty tokens and accepts the file only when it is regular, owner-owned, and mode `0600`. It refuses the headless profile if the keyring later becomes accessible. Upstream does not currently document an isolated per-profile auth root or profile selector.
 
 If a profile with that name already exists, use `--yes` to overwrite it:
 
