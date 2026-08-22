@@ -1111,9 +1111,17 @@ fn use_antigravity_restores_live_keyring_and_config_roots() {
 #[cfg(target_os = "linux")]
 #[test]
 fn use_antigravity_headless_profile_switches_native_file_without_keyring_write() {
+    use std::os::unix::fs::PermissionsExt;
+
     let env = TestEnv::new();
     add_antigravity_headless_profile(&env, "work", ANTIGRAVITY_SECRET_WORK, "terminal");
-    write_antigravity_headless_live_state(&env, ANTIGRAVITY_SECRET_PERSONAL, "light");
+    write_antigravity_headless_live_state(&env, ANTIGRAVITY_SECRET_WORK, "terminal");
+    let live_token = env
+        .fake_home
+        .join(".gemini")
+        .join("antigravity-cli")
+        .join("antigravity-oauth-token");
+    std::fs::set_permissions(&live_token, std::fs::Permissions::from_mode(0o644)).unwrap();
 
     env.cmd()
         .env("AISW_KEYRING_TEST_UNAVAILABLE", "1")
@@ -1123,14 +1131,12 @@ fn use_antigravity_headless_profile_switches_native_file_without_keyring_write()
         .stdout(contains("OAuth shared live headless file"));
 
     assert_eq!(
-        std::fs::read_to_string(
-            env.fake_home
-                .join(".gemini")
-                .join("antigravity-cli")
-                .join("antigravity-oauth-token")
-        )
-        .unwrap(),
+        std::fs::read_to_string(&live_token).unwrap(),
         ANTIGRAVITY_SECRET_WORK
+    );
+    assert_eq!(
+        std::fs::metadata(&live_token).unwrap().permissions().mode() & 0o777,
+        0o600
     );
     assert!(!antigravity_live_keyring_secret_path(&env).exists());
 }

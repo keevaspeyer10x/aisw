@@ -1,5 +1,6 @@
 use std::collections::BTreeMap;
 use std::fs;
+use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::Duration;
@@ -169,7 +170,8 @@ pub fn live_credentials_snapshot_for_import(user_home: &Path) -> Result<Option<L
 
 pub fn capture_live_snapshot(user_home: &Path) -> Result<LiveSnapshot> {
     let keyring_ref = default_live_keyring_ref();
-    let app_files = read_live_dir(&live_app_dir(user_home))?;
+    let mut app_files =
+        read_live_dir_excluding(&live_app_dir(user_home), Some(HEADLESS_TOKEN_FILE))?;
     let (credential_source, keyring_secret) =
         match super::system_keyring::read_generic_password_state(
             &keyring_ref.service,
@@ -185,7 +187,9 @@ pub fn capture_live_snapshot(user_home: &Path) -> Result<LiveSnapshot> {
                 if !cfg!(target_os = "linux") {
                     bail!(detail);
                 }
-                validate_live_headless_token(user_home, &app_files)?;
+                if let Some(token) = read_validated_live_headless_token(user_home)? {
+                    app_files.insert(HEADLESS_TOKEN_FILE.to_owned(), token);
+                }
                 (LiveCredentialSource::HeadlessFile, None)
             }
         };
@@ -205,59 +209,154 @@ fn headless_token_from_files(files_map: &BTreeMap<String, Vec<u8>>) -> Option<&[
         .map(Vec::as_slice)
 }
 
-fn validate_live_headless_token(
-    user_home: &Path,
-    app_files: &BTreeMap<String, Vec<u8>>,
-) -> Result<()> {
+#[cfg(target_os = "linux")]
+fn read_validated_live_headless_token(user_home: &Path) -> Result<Option<Vec<u8>>> {
+    use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
+
     let path = live_app_dir(user_home).join(HEADLESS_TOKEN_FILE);
-    if !path.exists() {
-        return Ok(());
-    }
-    let metadata = fs::symlink_metadata(&path)
-        .with_context(|| format!("could not stat {}", path.display()))?;
-    if metadata.file_type().is_symlink() || !metadata.file_type().is_file() {
+    let initial_metadata = match fs::symlink_metadata(&path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => {
+            return Err(error).with_context(|| format!("could not stat {}", path.display()));
+        }
+    };
+    if initial_metadata.file_type().is_symlink() || !initial_metadata.file_type().is_file() {
         bail!(
             "refusing Antigravity headless token that is not a regular file: {}",
             path.display()
         );
     }
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::{MetadataExt, PermissionsExt};
 
-        let mode = metadata.permissions().mode() & 0o777;
-        if mode != 0o600 {
-            bail!(
-                "permissions on {} are too broad (got {:04o}, expected 0600)",
-                path.display(),
-                mode
-            );
-        }
-        if metadata.uid() != unsafe { libc::geteuid() } {
-            bail!(
-                "refusing Antigravity headless token not owned by the current user: {}",
-                path.display()
-            );
-        }
+    let mut file = fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+        .open(&path)
+        .with_context(|| format!("could not securely open {}", path.display()))?;
+    let metadata = file
+        .metadata()
+        .with_context(|| format!("could not inspect opened token {}", path.display()))?;
+    if !metadata.file_type().is_file() {
+        bail!(
+            "refusing Antigravity headless token that is not a regular file: {}",
+            path.display()
+        );
     }
-    if headless_token_from_files(app_files).is_none() {
+    let mode = metadata.permissions().mode() & 0o777;
+    if mode != 0o600 {
+        bail!(
+            "permissions on {} are too broad (got {:04o}, expected 0600)",
+            path.display(),
+            mode
+        );
+    }
+    if metadata.uid() != unsafe { libc::geteuid() } {
+        bail!(
+            "refusing Antigravity headless token not owned by the current user: {}",
+            path.display()
+        );
+    }
+
+    let mut token = Vec::new();
+    file.read_to_end(&mut token)
+        .with_context(|| format!("could not read opened token {}", path.display()))?;
+    if token.is_empty() {
         bail!("Antigravity headless token is empty: {}", path.display());
     }
-    Ok(())
+    Ok(Some(token))
+}
+
+#[cfg(not(target_os = "linux"))]
+fn read_validated_live_headless_token(_user_home: &Path) -> Result<Option<Vec<u8>>> {
+    bail!("Antigravity headless file authentication is supported on Linux only")
 }
 
 fn read_live_dir(dir: &Path) -> Result<BTreeMap<String, Vec<u8>>> {
+    read_live_dir_excluding(dir, None)
+}
+
+fn read_live_dir_excluding(
+    dir: &Path,
+    excluded_file: Option<&str>,
+) -> Result<BTreeMap<String, Vec<u8>>> {
     if !dir.exists() {
         return Ok(BTreeMap::new());
     }
     let mut files_map = BTreeMap::new();
     for file in files::list_regular_files_recursive(dir)? {
         let relative = file.file_name.to_string_lossy().into_owned();
+        if excluded_file == Some(relative.as_str()) {
+            continue;
+        }
         let bytes = fs::read(&file.path)
             .with_context(|| format!("could not read {}", file.path.display()))?;
         files_map.insert(relative, bytes);
     }
     Ok(files_map)
+}
+
+struct ProfileOverwriteSnapshot {
+    files: Vec<(String, Vec<u8>)>,
+    secure_secret: Option<Vec<u8>>,
+    secure_backend_was_tracked: bool,
+}
+
+impl ProfileOverwriteSnapshot {
+    fn capture(
+        profile_store: &ProfileStore,
+        config_store: &ConfigStore,
+        profile_name: &str,
+    ) -> Result<Self> {
+        let config = config_store.load()?;
+        let files = files::list_regular_files_recursive(
+            &profile_store.profile_dir(Tool::Antigravity, profile_name),
+        )?
+        .into_iter()
+        .map(|file| {
+            let bytes = fs::read(&file.path)
+                .with_context(|| format!("could not read {}", file.path.display()))?;
+            Ok((file.file_name.to_string_lossy().into_owned(), bytes))
+        })
+        .collect::<Result<Vec<_>>>()?;
+        let secure_backend_was_tracked = config
+            .profiles_for(Tool::Antigravity)
+            .get(profile_name)
+            .map(|meta| meta.credential_backend)
+            == Some(CredentialBackend::SystemKeyring);
+        let secure_secret = if secure_backend_was_tracked {
+            secure_store::read_profile_secret(Tool::Antigravity, profile_name)?
+        } else {
+            None
+        };
+        Ok(Self {
+            files,
+            secure_secret,
+            secure_backend_was_tracked,
+        })
+    }
+
+    fn restore(
+        &self,
+        profile_store: &ProfileStore,
+        profile_name: &str,
+        touched_backend: CredentialBackend,
+    ) -> Result<()> {
+        if profile_store.exists(Tool::Antigravity, profile_name) {
+            profile_store.delete(Tool::Antigravity, profile_name)?;
+        }
+        profile_store.create(Tool::Antigravity, profile_name)?;
+        for (filename, bytes) in &self.files {
+            profile_store.write_file(Tool::Antigravity, profile_name, filename, bytes)?;
+        }
+
+        if touched_backend == CredentialBackend::SystemKeyring || self.secure_backend_was_tracked {
+            secure_store::delete_profile_secret(Tool::Antigravity, profile_name)?;
+        }
+        if let Some(secret) = &self.secure_secret {
+            secure_store::write_profile_secret(Tool::Antigravity, profile_name, secret)?;
+        }
+        Ok(())
+    }
 }
 
 pub fn write_profile_snapshot(
@@ -269,20 +368,12 @@ pub fn write_profile_snapshot(
     snapshot: &LiveSnapshot,
     overwrite_existing: bool,
 ) -> Result<()> {
-    let existing_source_marker = if overwrite_existing {
-        let path = profile_store
-            .profile_dir(Tool::Antigravity, profile_name)
-            .join(AUTH_SOURCE_FILE);
-        if path.exists() {
-            Some(profile_store.read_file(Tool::Antigravity, profile_name, AUTH_SOURCE_FILE)?)
-        } else {
-            None
-        }
-    } else {
-        None
-    };
-    let existing_secret = if overwrite_existing {
-        read_managed_secret(profile_store, profile_name, backend)?
+    let overwrite_snapshot = if overwrite_existing {
+        Some(ProfileOverwriteSnapshot::capture(
+            profile_store,
+            config_store,
+            profile_name,
+        )?)
     } else {
         None
     };
@@ -295,33 +386,19 @@ pub fn write_profile_snapshot(
         snapshot,
         overwrite_existing,
     );
-    if result.is_err() && overwrite_existing {
-        match existing_source_marker {
-            Some(marker) => {
-                let _ = profile_store.write_file(
-                    Tool::Antigravity,
-                    profile_name,
-                    AUTH_SOURCE_FILE,
-                    &marker,
-                );
+    match (result, overwrite_snapshot) {
+        (Err(error), Some(overwrite_snapshot)) => {
+            if let Err(rollback_error) =
+                overwrite_snapshot.restore(profile_store, profile_name, backend)
+            {
+                return Err(error.context(format!(
+                    "failed to restore overwritten Antigravity profile: {rollback_error:#}"
+                )));
             }
-            None => {
-                let _ = remove_optional_profile_file(profile_store, profile_name, AUTH_SOURCE_FILE);
-            }
+            Err(error)
         }
+        (result, _) => result,
     }
-    if result.is_err() && overwrite_existing && backend == CredentialBackend::SystemKeyring {
-        match existing_secret {
-            Some(secret) => {
-                let _ =
-                    secure_store::write_profile_secret(Tool::Antigravity, profile_name, &secret);
-            }
-            None => {
-                let _ = secure_store::delete_profile_secret(Tool::Antigravity, profile_name);
-            }
-        }
-    }
-    result
 }
 
 fn write_profile_snapshot_inner(
@@ -540,18 +617,24 @@ fn build_apply_transaction(
     profile_name: &str,
     user_home: &Path,
 ) -> Result<Vec<LiveFileChange>> {
-    let stored_app = profile_tree_map(profile_store, profile_name, APP_PREFIX)?;
+    let source = read_profile_credential_source(profile_store, profile_name)?;
+    let mut stored_app = profile_tree_map(profile_store, profile_name, APP_PREFIX)?;
+    if source == LiveCredentialSource::Keyring {
+        stored_app.remove(HEADLESS_TOKEN_FILE);
+    }
     let stored_shared = profile_tree_map(profile_store, profile_name, SHARED_PREFIX)?;
     let mut changes = Vec::new();
     changes.extend(sync_dir_to_live(
         &stored_app,
         &live_app_dir(user_home),
         &read_live_dir(&live_app_dir(user_home))?,
+        source == LiveCredentialSource::HeadlessFile,
     ));
     changes.extend(sync_dir_to_live(
         &stored_shared,
         &live_shared_dir(user_home),
         &read_live_dir(&live_shared_dir(user_home))?,
+        false,
     ));
     Ok(changes)
 }
@@ -560,11 +643,13 @@ fn sync_dir_to_live(
     stored: &BTreeMap<String, Vec<u8>>,
     live_root: &Path,
     live: &BTreeMap<String, Vec<u8>>,
+    rewrite_headless_token: bool,
 ) -> Vec<LiveFileChange> {
     let mut changes = Vec::new();
     for (relative, bytes) in stored {
         let live_bytes = live.get(relative);
-        if live_bytes != Some(bytes) {
+        if live_bytes != Some(bytes) || (rewrite_headless_token && relative == HEADLESS_TOKEN_FILE)
+        {
             changes.push(LiveFileChange::write(
                 live_root.join(relative),
                 bytes.clone(),
@@ -606,7 +691,8 @@ pub fn live_state_matches(
     backend: CredentialBackend,
     user_home: &Path,
 ) -> Result<bool> {
-    match read_profile_credential_source(profile_store, profile_name)? {
+    let source = read_profile_credential_source(profile_store, profile_name)?;
+    let live_app = match source {
         LiveCredentialSource::Keyring => {
             let keyring_ref = read_profile_keyring_ref(profile_store, profile_name)?;
             let managed_secret = read_managed_secret(profile_store, profile_name, backend)?;
@@ -617,6 +703,7 @@ pub fn live_state_matches(
             if managed_secret != live_secret {
                 return Ok(false);
             }
+            read_live_dir_excluding(&live_app_dir(user_home), Some(HEADLESS_TOKEN_FILE))?
         }
         LiveCredentialSource::HeadlessFile => {
             if validate_headless_profile_backend(backend).is_err() {
@@ -625,15 +712,21 @@ pub fn live_state_matches(
             if ensure_keyring_unavailable_for_headless_profile().is_err() {
                 return Ok(false);
             }
-            if validate_live_headless_token(user_home, &read_live_dir(&live_app_dir(user_home))?)
-                .is_err()
-            {
-                return Ok(false);
-            }
+            let mut app_files =
+                read_live_dir_excluding(&live_app_dir(user_home), Some(HEADLESS_TOKEN_FILE))?;
+            let token = match read_validated_live_headless_token(user_home) {
+                Ok(Some(token)) => token,
+                Ok(None) | Err(_) => return Ok(false),
+            };
+            app_files.insert(HEADLESS_TOKEN_FILE.to_owned(), token);
+            app_files
         }
+    };
+    let mut stored_app = profile_tree_map(profile_store, profile_name, APP_PREFIX)?;
+    if source == LiveCredentialSource::Keyring {
+        stored_app.remove(HEADLESS_TOKEN_FILE);
     }
-    Ok(profile_tree_map(profile_store, profile_name, APP_PREFIX)?
-        == read_live_dir(&live_app_dir(user_home))?
+    Ok(stored_app == live_app
         && profile_tree_map(profile_store, profile_name, SHARED_PREFIX)?
             == read_live_dir(&live_shared_dir(user_home))?)
 }
@@ -767,16 +860,22 @@ pub fn restore_live_state_after_oauth_add(
 
 pub fn restore_snapshot_to_live(snapshot: &LiveSnapshot, user_home: &Path) -> Result<()> {
     let changes = {
+        let mut app_files = snapshot.app_files.clone();
+        if snapshot.credential_source == LiveCredentialSource::Keyring {
+            app_files.remove(HEADLESS_TOKEN_FILE);
+        }
         let mut changes = Vec::new();
         changes.extend(sync_dir_to_live(
-            &snapshot.app_files,
+            &app_files,
             &live_app_dir(user_home),
             &read_live_dir(&live_app_dir(user_home))?,
+            snapshot.credential_source == LiveCredentialSource::HeadlessFile,
         ));
         changes.extend(sync_dir_to_live(
             &snapshot.shared_files,
             &live_shared_dir(user_home),
             &read_live_dir(&live_shared_dir(user_home))?,
+            false,
         ));
         changes
     };
@@ -1040,6 +1139,25 @@ mod tests {
         assert!(snapshot.is_none());
     }
 
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn keyring_capture_excludes_a_stale_headless_token() {
+        let _g = crate::SPAWN_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let temp = tempdir().unwrap();
+        let _keyring = EnvVarGuard::set("AISW_KEYRING_TEST_DIR", temp.path());
+        let user_home = temp.path().join("user");
+        fs::create_dir_all(&user_home).unwrap();
+        write_live_state(&user_home, br#"{"email":"work@example.com"}"#);
+        let token_path = live_app_dir(&user_home).join(HEADLESS_TOKEN_FILE);
+        fs::write(&token_path, br#"{"email":"stale@example.com"}"#).unwrap();
+        files::set_permissions_600(&token_path).unwrap();
+
+        let snapshot = capture_live_snapshot(&user_home).unwrap();
+
+        assert_eq!(snapshot.credential_source, LiveCredentialSource::Keyring);
+        assert!(!snapshot.app_files.contains_key(HEADLESS_TOKEN_FILE));
+    }
+
     #[test]
     fn write_profile_snapshot_system_keyring_backend_stores_secret_outside_profile_dir() {
         let _g = crate::SPAWN_LOCK.lock().unwrap_or_else(|p| p.into_inner());
@@ -1081,7 +1199,7 @@ mod tests {
 
     #[cfg(target_os = "linux")]
     #[test]
-    fn failed_overwrite_restores_the_previous_credential_source_marker() {
+    fn failed_overwrite_restores_the_complete_previous_profile() {
         let temp = tempdir().unwrap();
         let home = temp.path().join("home");
         fs::create_dir_all(&home).unwrap();
@@ -1091,21 +1209,58 @@ mod tests {
         profile_store.create(Tool::Antigravity, "work").unwrap();
         persist_profile_credential_source(&profile_store, "work", LiveCredentialSource::Keyring)
             .unwrap();
+        persist_profile_keyring_ref(&profile_store, "work", &default_live_keyring_ref()).unwrap();
+        persist_managed_secret(
+            &profile_store,
+            "work",
+            CredentialBackend::File,
+            br#"{"email":"old@example.com"}"#,
+        )
+        .unwrap();
         profile_store
-            .write_file(Tool::Antigravity, "work", APP_PREFIX, b"not-a-directory")
+            .write_file(
+                Tool::Antigravity,
+                "work",
+                "app/settings.json",
+                br#"{"theme":"old"}"#,
+            )
             .unwrap();
+        profile_store
+            .write_file(
+                Tool::Antigravity,
+                "work",
+                "shared/project.json",
+                br#"{"project":"old"}"#,
+            )
+            .unwrap();
+        config_store
+            .add_profile(
+                Tool::Antigravity,
+                "work",
+                ProfileMeta {
+                    added_at: Utc::now(),
+                    auth_method: AuthMethod::OAuth,
+                    credential_backend: CredentialBackend::File,
+                    label: Some("old".to_owned()),
+                },
+            )
+            .unwrap();
+        fs::create_dir(home.join("config.json.tmp")).unwrap();
 
         let mut app_files = BTreeMap::new();
         app_files.insert(
             HEADLESS_TOKEN_FILE.to_owned(),
             br#"{"email":"new@example.com"}"#.to_vec(),
         );
+        app_files.insert("settings.json".to_owned(), br#"{"theme":"new"}"#.to_vec());
+        let mut shared_files = BTreeMap::new();
+        shared_files.insert("project.json".to_owned(), br#"{"project":"new"}"#.to_vec());
         let snapshot = LiveSnapshot {
             credential_source: LiveCredentialSource::HeadlessFile,
             keyring_ref: default_live_keyring_ref(),
             keyring_secret: None,
             app_files,
-            shared_files: BTreeMap::new(),
+            shared_files,
         };
 
         let error = write_profile_snapshot(
@@ -1119,11 +1274,37 @@ mod tests {
         )
         .unwrap_err();
 
-        assert!(error.to_string().contains("could not delete"));
+        assert!(error.to_string().contains("config.json.tmp"));
         assert_eq!(
             read_profile_credential_source(&profile_store, "work").unwrap(),
             LiveCredentialSource::Keyring
         );
+        assert_eq!(
+            read_profile_keyring_ref(&profile_store, "work").unwrap(),
+            default_live_keyring_ref()
+        );
+        assert_eq!(
+            read_managed_secret(&profile_store, "work", CredentialBackend::File)
+                .unwrap()
+                .unwrap(),
+            br#"{"email":"old@example.com"}"#
+        );
+        assert_eq!(
+            profile_store
+                .read_file(Tool::Antigravity, "work", "app/settings.json")
+                .unwrap(),
+            br#"{"theme":"old"}"#
+        );
+        assert_eq!(
+            profile_store
+                .read_file(Tool::Antigravity, "work", "shared/project.json")
+                .unwrap(),
+            br#"{"project":"old"}"#
+        );
+        assert!(!profile_store
+            .profile_dir(Tool::Antigravity, "work")
+            .join(STORED_HEADLESS_TOKEN_FILE)
+            .exists());
     }
 
     #[test]
